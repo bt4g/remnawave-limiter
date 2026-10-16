@@ -3,6 +3,7 @@ package telegram
 import (
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,45 +12,52 @@ import (
 	"github.com/remnawave/limiter/internal/i18n"
 )
 
-const asnOrgMaxLen = 40
+const (
+	asnOrgMaxLen = 40
+	// maxIPRows ограничивает таблицу адресов: у rich-сообщения лимит в 500 блоков,
+	// и каждая строка таблицы считается отдельным блоком.
+	maxIPRows = 30
+)
+
+// Все Format* возвращают тело rich-сообщения в формате rich HTML без кнопок:
+// кнопки добавляет Bot при отправке. Любое подставляемое значение проходит через escapeHTML.
 
 func FormatManualAlert(user *api.CachedUser, ips []api.ActiveIP, limit int, violationCount int64, loc *time.Location, subnetGroups int, subnetEnabled bool, asnGroups int, asnEnabled bool) string {
 	var b strings.Builder
 
-	b.WriteString(i18n.T("alert.manual.title") + "\n\n")
-	b.WriteString(fmt.Sprintf("%s: <code>%s</code>\n", i18n.T("alert.user"), escapeHTML(user.Username)))
-	b.WriteString(formatGroupingLine(limit, subnetGroups, len(ips), countUniqueASN(ips), subnetEnabled, asnGroups, asnEnabled))
-	b.WriteString(fmt.Sprintf("%s: %d\n", i18n.T("alert.violations_24h"), violationCount))
-	b.WriteString(fmt.Sprintf("🕐 %s\n", time.Now().In(loc).Format("02.01.2006 15:04:05")))
+	b.WriteString("<h3>" + escapeHTML(i18n.T("alert.manual.title")) + "</h3>")
+	b.WriteString("<table bordered striped compact>")
+	writeUserRows(&b, user)
+	writeGroupingRows(&b, limit, ips, subnetGroups, subnetEnabled, asnGroups, asnEnabled)
+	b.WriteString(tableRow(i18n.T("alert.violations_24h"), strconv.FormatInt(violationCount, 10)))
+	b.WriteString(tableRow(i18n.T("alert.time"), tgTime(time.Now(), loc, "wDT")))
+	b.WriteString("</table>")
 
-	b.WriteString(fmt.Sprintf("\n%s:\n", i18n.T("alert.ips_header")))
-	writeIPList(&b, ips)
-
-	if user.SubscriptionURL != "" {
-		b.WriteString(fmt.Sprintf("\n<a href=\"%s\">%s</a>", escapeHTML(user.SubscriptionURL), i18n.T("alert.profile")))
-	}
+	writeIPTable(&b, ips, true)
 
 	return b.String()
 }
 
 func FormatAutoAlert(user *api.CachedUser, ips []api.ActiveIP, limit, durationMinutes int, violationCount int64, loc *time.Location, subnetGroups int, subnetEnabled bool, asnGroups int, asnEnabled bool) string {
 	var b strings.Builder
+	now := time.Now()
 
-	b.WriteString(i18n.T("alert.auto.title") + "\n\n")
-	b.WriteString(fmt.Sprintf("%s: <code>%s</code>\n", i18n.T("alert.user"), escapeHTML(user.Username)))
-	b.WriteString(formatGroupingLine(limit, subnetGroups, len(ips), countUniqueASN(ips), subnetEnabled, asnGroups, asnEnabled))
-	b.WriteString(fmt.Sprintf("%s: %d\n", i18n.T("alert.violations_24h"), violationCount))
-
+	b.WriteString("<h3>" + escapeHTML(i18n.T("alert.auto.title")) + "</h3>")
+	b.WriteString("<table bordered striped compact>")
+	writeUserRows(&b, user)
+	writeGroupingRows(&b, limit, ips, subnetGroups, subnetEnabled, asnGroups, asnEnabled)
+	b.WriteString(tableRow(i18n.T("alert.violations_24h"), strconv.FormatInt(violationCount, 10)))
 	if durationMinutes == 0 {
-		b.WriteString(fmt.Sprintf("%s: %s\n", i18n.T("alert.disabled_for"), i18n.T("alert.permanent")))
+		b.WriteString(tableRow(i18n.T("alert.disabled_for"), "<b>"+escapeHTML(i18n.T("alert.permanent"))+"</b>"))
 	} else {
-		b.WriteString(fmt.Sprintf("%s: %d %s\n", i18n.T("alert.disabled_for"), durationMinutes, i18n.T("duration.min")))
+		b.WriteString(tableRow(i18n.T("alert.disabled_for"), escapeHTML(FormatDuration(durationMinutes))))
+		restoreAt := now.Add(time.Duration(durationMinutes) * time.Minute)
+		b.WriteString(tableRow(i18n.T("alert.restores_at"), tgTime(restoreAt, loc, "wDT")))
 	}
+	b.WriteString(tableRow(i18n.T("alert.time"), tgTime(now, loc, "wDT")))
+	b.WriteString("</table>")
 
-	b.WriteString(fmt.Sprintf("🕐 %s\n", time.Now().In(loc).Format("02.01.2006 15:04:05")))
-
-	b.WriteString(fmt.Sprintf("\n%s:\n", i18n.T("alert.ips_header")))
-	writeIPList(&b, ips)
+	writeIPTable(&b, ips, false)
 
 	return b.String()
 }
@@ -57,15 +65,16 @@ func FormatAutoAlert(user *api.CachedUser, ips []api.ActiveIP, limit, durationMi
 func FormatSoftAlert(user *api.CachedUser, ips []api.ActiveIP, limit, banThreshold int, loc *time.Location, subnetGroups int, subnetEnabled bool, asnGroups int, asnEnabled bool) string {
 	var b strings.Builder
 
-	b.WriteString(i18n.T("alert.soft.title") + "\n\n")
-	b.WriteString(fmt.Sprintf("%s: <code>%s</code>\n", i18n.T("alert.user"), escapeHTML(user.Username)))
-	b.WriteString(formatGroupingLine(limit, subnetGroups, len(ips), countUniqueASN(ips), subnetEnabled, asnGroups, asnEnabled))
-	b.WriteString(fmt.Sprintf("%s: %d\n", i18n.T("alert.ban_threshold"), banThreshold))
-	b.WriteString(i18n.T("alert.soft.note") + "\n")
-	b.WriteString(fmt.Sprintf("🕐 %s\n", time.Now().In(loc).Format("02.01.2006 15:04:05")))
+	b.WriteString("<h3>" + escapeHTML(i18n.T("alert.soft.title")) + "</h3>")
+	b.WriteString("<table bordered striped compact>")
+	writeUserRows(&b, user)
+	writeGroupingRows(&b, limit, ips, subnetGroups, subnetEnabled, asnGroups, asnEnabled)
+	b.WriteString(tableRow(i18n.T("alert.ban_threshold"), strconv.Itoa(banThreshold)))
+	b.WriteString(tableRow(i18n.T("alert.time"), tgTime(time.Now(), loc, "wDT")))
+	b.WriteString("</table>")
+	b.WriteString("<blockquote>" + escapeHTML(i18n.T("alert.soft.note")) + "</blockquote>")
 
-	b.WriteString(fmt.Sprintf("\n%s:\n", i18n.T("alert.ips_header")))
-	writeIPList(&b, ips)
+	writeIPTable(&b, ips, false)
 
 	return b.String()
 }
@@ -81,53 +90,138 @@ func FormatDailyReport(stats *cache.ViolationStats, loc *time.Location) string {
 func formatStatsMessage(title string, stats *cache.ViolationStats, loc *time.Location) string {
 	var b strings.Builder
 
-	b.WriteString(title + "\n\n")
-	b.WriteString(fmt.Sprintf("%s: <b>%d</b>\n", i18n.T("stats.last_24h"), stats.Count24h))
-	b.WriteString(fmt.Sprintf("%s: <b>%d</b>\n", i18n.T("stats.last_week"), stats.CountWeek))
+	b.WriteString("<h3>" + escapeHTML(title) + "</h3>")
+	b.WriteString("<table bordered compact><tr>")
+	b.WriteString("<th align=\"center\">" + escapeHTML(i18n.T("stats.last_24h")) + "</th>")
+	b.WriteString("<th align=\"center\">" + escapeHTML(i18n.T("stats.last_week")) + "</th>")
+	b.WriteString("</tr><tr>")
+	b.WriteString(fmt.Sprintf("<td align=\"center\"><b>%d</b></td>", stats.Count24h))
+	b.WriteString(fmt.Sprintf("<td align=\"center\"><b>%d</b></td>", stats.CountWeek))
+	b.WriteString("</tr></table>")
 
 	if len(stats.Top) == 0 {
-		b.WriteString("\n" + i18n.T("stats.empty") + "\n")
+		b.WriteString("<blockquote>" + escapeHTML(i18n.T("stats.empty")) + "</blockquote>")
 	} else {
-		b.WriteString(fmt.Sprintf("\n%s:\n", i18n.T("stats.top_header")))
-		suffix := i18n.T("stats.count_suffix")
+		b.WriteString("<h4>" + escapeHTML(i18n.T("stats.top_header")) + "</h4>")
+		b.WriteString("<table striped compact><tr>")
+		b.WriteString("<th align=\"center\">#</th>")
+		b.WriteString("<th align=\"left\">" + escapeHTML(i18n.T("stats.col_user")) + "</th>")
+		b.WriteString("<th align=\"right\">" + escapeHTML(i18n.T("stats.col_count")) + "</th>")
+		b.WriteString("</tr>")
 		for i, v := range stats.Top {
 			name := v.Username
 			if name == "" {
 				name = v.UserID
 			}
-			b.WriteString(fmt.Sprintf("%d. <code>%s</code> — %d %s\n", i+1, escapeHTML(name), v.Count, suffix))
+			b.WriteString("<tr>")
+			b.WriteString("<td align=\"center\">" + rankMark(i) + "</td>")
+			b.WriteString("<td><code>" + escapeHTML(name) + "</code></td>")
+			b.WriteString(fmt.Sprintf("<td align=\"right\"><b>%d</b></td>", v.Count))
+			b.WriteString("</tr>")
 		}
+		b.WriteString("</table>")
 	}
 
-	b.WriteString(fmt.Sprintf("\n🕐 %s", time.Now().In(loc).Format("02.01.2006 15:04:05")))
+	b.WriteString("<footer>" + escapeHTML(i18n.T("stats.updated")) + " " + tgTime(time.Now(), loc, "wDT") + "</footer>")
 
 	return b.String()
 }
 
-func writeIPList(b *strings.Builder, ips []api.ActiveIP) {
-	const maxIPs = 10
-	for i, ip := range ips {
-		if i >= maxIPs {
-			b.WriteString(fmt.Sprintf("  … %s %d\n", i18n.T("alert.and_more"), len(ips)-maxIPs))
-			return
-		}
-		href := "https://ipinfo.io/" + url.PathEscape(ip.IP)
-		org := strings.TrimSpace(ip.ASNOrg)
-		if org != "" {
-			b.WriteString(fmt.Sprintf("  • <a href=\"%s\">%s</a> - %s (%s)\n",
-				escapeHTML(href), escapeHTML(ip.IP), escapeHTML(truncateASNOrg(org)), escapeHTML(ip.NodeName)))
-		} else {
-			b.WriteString(fmt.Sprintf("  • <a href=\"%s\">%s</a> (%s)\n",
-				escapeHTML(href), escapeHTML(ip.IP), escapeHTML(ip.NodeName)))
-		}
+func rankMark(i int) string {
+	switch i {
+	case 0:
+		return "🥇"
+	case 1:
+		return "🥈"
+	case 2:
+		return "🥉"
+	}
+	return strconv.Itoa(i + 1)
+}
+
+func writeUserRows(b *strings.Builder, user *api.CachedUser) {
+	b.WriteString(tableRow(i18n.T("alert.user"), "<code>"+escapeHTML(user.Username)+"</code>"))
+	if user.SubscriptionURL != "" {
+		b.WriteString(tableRow(i18n.T("alert.profile"),
+			"<a href=\""+escapeHTML(user.SubscriptionURL)+"\">"+escapeHTML(i18n.T("alert.open"))+"</a>"))
 	}
 }
 
+// writeGroupingRows показывает лимит, то, что реально сравнивалось с лимитом
+// (ASN-группы, подсети или IP), и величину превышения.
+func writeGroupingRows(b *strings.Builder, limit int, ips []api.ActiveIP, subnetGroups int, subnetEnabled bool, asnGroups int, asnEnabled bool) {
+	ipCount := len(ips)
+	counted := ipCount
+
+	b.WriteString(tableRow(i18n.T("alert.limit"), "<b>"+strconv.Itoa(limit)+"</b>"))
+
+	switch {
+	case asnEnabled:
+		counted = asnGroups
+		b.WriteString(tableRow(i18n.T("alert.asn_groups"), "<b>"+strconv.Itoa(asnGroups)+"</b>"))
+	case subnetEnabled && subnetGroups > 0 && subnetGroups < ipCount:
+		counted = subnetGroups
+		b.WriteString(tableRow(i18n.T("alert.subnets"), "<b>"+strconv.Itoa(subnetGroups)+"</b>"))
+	}
+
+	detected := fmt.Sprintf("%d IP", ipCount)
+	if asnCount := countUniqueASN(ips); !asnEnabled && asnCount > 0 {
+		detected += fmt.Sprintf(" · %d %s", asnCount, escapeHTML(i18n.T("alert.asn_count")))
+	}
+	b.WriteString(tableRow(i18n.T("alert.detected_ips"), detected))
+
+	if over := counted - limit; over > 0 && limit > 0 {
+		b.WriteString(tableRow(i18n.T("alert.overflow"), fmt.Sprintf("<mark>+%d</mark>", over)))
+	}
+}
+
+// writeIPTable выводит адреса таблицей внутри сворачиваемого блока <details>.
+func writeIPTable(b *strings.Builder, ips []api.ActiveIP, open bool) {
+	if len(ips) == 0 {
+		return
+	}
+	if open {
+		b.WriteString("<details open>")
+	} else {
+		b.WriteString("<details>")
+	}
+	b.WriteString(fmt.Sprintf("<summary>%s (%d)</summary>", escapeHTML(i18n.T("alert.ips_header")), len(ips)))
+	b.WriteString("<table striped compact><tr>")
+	b.WriteString("<th align=\"left\">IP</th>")
+	b.WriteString("<th align=\"left\">" + escapeHTML(i18n.T("alert.col_provider")) + "</th>")
+	b.WriteString("<th align=\"left\">" + escapeHTML(i18n.T("alert.col_node")) + "</th>")
+	b.WriteString("</tr>")
+	for i, ip := range ips {
+		if i >= maxIPRows {
+			b.WriteString(fmt.Sprintf("<tr><td colspan=\"3\" align=\"center\">… %s %d</td></tr>",
+				escapeHTML(i18n.T("alert.and_more")), len(ips)-maxIPRows))
+			break
+		}
+		href := "https://ipinfo.io/" + url.PathEscape(ip.IP)
+		org := strings.TrimSpace(ip.ASNOrg)
+		if org == "" {
+			org = "—"
+		} else {
+			org = truncateASNOrg(org)
+		}
+		b.WriteString("<tr>")
+		b.WriteString("<td><a href=\"" + escapeHTML(href) + "\">" + escapeHTML(ip.IP) + "</a></td>")
+		b.WriteString("<td>" + escapeHTML(org) + "</td>")
+		b.WriteString("<td>" + escapeHTML(ip.NodeName) + "</td>")
+		b.WriteString("</tr>")
+	}
+	b.WriteString("</table></details>")
+}
+
+// truncateASNOrg обрезает название провайдера до asnOrgMaxLen символов.
+// Считаются руны, а не байты: срез по байтам разрезал бы многобайтный символ
+// и давал невалидный UTF-8, который Telegram отвергает.
 func truncateASNOrg(s string) string {
-	if len(s) <= asnOrgMaxLen {
+	runes := []rune(s)
+	if len(runes) <= asnOrgMaxLen {
 		return s
 	}
-	cut := strings.TrimRight(s[:asnOrgMaxLen-1], " ")
+	cut := strings.TrimRight(string(runes[:asnOrgMaxLen-1]), " ")
 	return cut + "…"
 }
 
@@ -142,25 +236,28 @@ func countUniqueASN(ips []api.ActiveIP) int {
 	return len(seen)
 }
 
-func FormatActionResult(action, adminName string) string {
-	var msg string
+func actionResultText(action string) string {
 	switch action {
 	case "drop":
-		msg = i18n.T("action.drop")
+		return i18n.T("action.drop")
 	case "disable":
-		msg = i18n.T("action.disable")
+		return i18n.T("action.disable")
 	case "disable_temp":
-		msg = i18n.T("action.disable_temp")
+		return i18n.T("action.disable_temp")
 	case "ignore":
-		msg = i18n.T("action.ignore")
+		return i18n.T("action.ignore")
 	case "ignore_temp":
-		msg = i18n.T("action.ignore_temp")
+		return i18n.T("action.ignore_temp")
 	case "enable":
-		msg = i18n.T("action.enable")
-	default:
-		msg = i18n.T("action.unknown")
+		return i18n.T("action.enable")
 	}
-	return fmt.Sprintf("\n\n%s (%s: %s)", msg, i18n.T("action.admin"), escapeHTML(adminName))
+	return i18n.T("action.unknown")
+}
+
+// FormatActionResult — приписка к старым текстовым алертам (parse_mode HTML),
+// отправленным до перехода на rich-сообщения.
+func FormatActionResult(action, adminName string) string {
+	return fmt.Sprintf("\n\n%s (%s: %s)", actionResultText(action), i18n.T("action.admin"), escapeHTML(adminName))
 }
 
 func FormatDuration(minutes int) string {
@@ -191,97 +288,68 @@ func FormatDuration(minutes int) string {
 
 func FormatStartupMessage(version, actionMode string, checkInterval, cooldown, tolerance int, toleranceMultiplier float64, defaultDeviceLimit, autoDisableDuration int, autoNotifySoft, webhookEnabled, subnetGrouping bool, subnetPrefixV4 int, asnGrouping, maxmindLoaded bool, violationThreshold, violationThresholdWindow int) string {
 	var b strings.Builder
+	sec := i18n.T("startup.sec")
 
-	b.WriteString(i18n.T("startup.title") + "\n\n")
-	b.WriteString(fmt.Sprintf("📦 %s: <code>%s</code>\n", i18n.T("startup.version"), version))
+	b.WriteString("<h3>" + escapeHTML(i18n.T("startup.title")) + "</h3>")
+	b.WriteString("<table bordered striped compact>")
+	b.WriteString(tableRow("📦 "+i18n.T("startup.version"), "<code>"+escapeHTML(version)+"</code>"))
 
 	mode := i18n.T("startup.mode_manual")
 	if actionMode == "auto" {
 		mode = i18n.T("startup.mode_auto")
 	}
-	b.WriteString(fmt.Sprintf("⚙️ %s: %s\n", i18n.T("startup.mode"), mode))
-	b.WriteString(fmt.Sprintf("⏱ %s: %d%s\n", i18n.T("startup.interval"), checkInterval, i18n.T("startup.sec")))
-	b.WriteString(fmt.Sprintf("🕐 %s: %d%s\n", i18n.T("startup.cooldown"), cooldown, i18n.T("startup.sec")))
-	b.WriteString(fmt.Sprintf("📊 %s: %d\n", i18n.T("startup.tolerance"), tolerance))
+	b.WriteString(tableRow("⚙️ "+i18n.T("startup.mode"), "<b>"+escapeHTML(mode)+"</b>"))
+	b.WriteString(tableRow("⏱ "+i18n.T("startup.interval"), fmt.Sprintf("%d%s", checkInterval, escapeHTML(sec))))
+	b.WriteString(tableRow("🕐 "+i18n.T("startup.cooldown"), fmt.Sprintf("%d%s", cooldown, escapeHTML(sec))))
+
+	tol := strconv.Itoa(tolerance)
 	if toleranceMultiplier > 0 {
-		b.WriteString(fmt.Sprintf("📊 %s: %.2f\n", i18n.T("startup.tolerance_mult"), toleranceMultiplier))
+		tol += fmt.Sprintf(" · ×%.2f", toleranceMultiplier)
 	}
+	b.WriteString(tableRow("📊 "+i18n.T("startup.tolerance"), tol))
 
 	if defaultDeviceLimit == 0 {
-		b.WriteString(fmt.Sprintf("📱 %s: %s\n", i18n.T("startup.default_limit"), i18n.T("startup.unlimited")))
+		b.WriteString(tableRow("📱 "+i18n.T("startup.default_limit"), escapeHTML(i18n.T("startup.unlimited"))))
 	} else {
-		b.WriteString(fmt.Sprintf("📱 %s: %d\n", i18n.T("startup.default_limit"), defaultDeviceLimit))
+		b.WriteString(tableRow("📱 "+i18n.T("startup.default_limit"), strconv.Itoa(defaultDeviceLimit)))
 	}
 
 	if autoDisableDuration > 0 {
-		b.WriteString(fmt.Sprintf("🔒 %s: %s\n", i18n.T("startup.auto_disable"), FormatDuration(autoDisableDuration)))
+		b.WriteString(tableRow("🔒 "+i18n.T("startup.auto_disable"), escapeHTML(FormatDuration(autoDisableDuration))))
 	}
-
-	if actionMode == "auto" && autoNotifySoft {
-		b.WriteString(fmt.Sprintf("🔔 %s: %s\n", i18n.T("startup.auto_notify_soft"), i18n.T("startup.enabled")))
+	if actionMode == "auto" {
+		b.WriteString(tableRow("🔔 "+i18n.T("startup.auto_notify_soft"), onOff(autoNotifySoft)))
 	}
-
-	webhookStatus := i18n.T("startup.disabled")
-	if webhookEnabled {
-		webhookStatus = i18n.T("startup.enabled")
-	}
-	b.WriteString(fmt.Sprintf("🔗 %s: %s\n", i18n.T("startup.webhook"), webhookStatus))
-
-	asnStatus := i18n.T("startup.disabled")
-	if asnGrouping {
-		asnStatus = i18n.T("startup.enabled")
-	}
-	b.WriteString(fmt.Sprintf("🛰 %s: %s\n", i18n.T("startup.asn_grouping"), asnStatus))
-
-	subnetStatus := i18n.T("startup.disabled")
-	if subnetGrouping {
-		subnetStatus = i18n.T("startup.enabled")
-	}
-	b.WriteString(fmt.Sprintf("🌐 %s: %s\n", i18n.T("startup.subnet_grouping"), subnetStatus))
-	if subnetGrouping && !asnGrouping {
-		b.WriteString(fmt.Sprintf("  ↳ /%d\n", subnetPrefixV4))
-	}
-
-	maxmindStatus := i18n.T("startup.maxmind_unavailable")
-	if maxmindLoaded {
-		maxmindStatus = i18n.T("startup.maxmind_loaded")
-	}
-	b.WriteString(fmt.Sprintf("🌍 %s: %s\n", i18n.T("startup.maxmind"), maxmindStatus))
-
 	if violationThreshold > 1 {
-		b.WriteString(fmt.Sprintf("🚦 %s: %d\n", i18n.T("startup.violation_threshold"), violationThreshold))
-		b.WriteString(fmt.Sprintf("🕐 %s: %d%s\n", i18n.T("startup.threshold_window"), violationThresholdWindow, i18n.T("startup.sec")))
+		b.WriteString(tableRow("🚦 "+i18n.T("startup.violation_threshold"),
+			fmt.Sprintf("%d / %d%s", violationThreshold, violationThresholdWindow, escapeHTML(sec))))
 	}
 
-	b.WriteString("\n" + i18n.T("startup.settings_hint"))
+	b.WriteString(tableRow("🛰 "+i18n.T("startup.asn_grouping"), onOff(asnGrouping)))
+	subnet := onOff(subnetGrouping)
+	if subnetGrouping && !asnGrouping {
+		subnet += fmt.Sprintf(" · <code>/%d</code>", subnetPrefixV4)
+	}
+	b.WriteString(tableRow("🌐 "+i18n.T("startup.subnet_grouping"), subnet))
+	b.WriteString(tableRow("🔗 "+i18n.T("startup.webhook"), onOff(webhookEnabled)))
+
+	maxmind := "✅ " + escapeHTML(i18n.T("startup.maxmind_loaded"))
+	if !maxmindLoaded {
+		maxmind = "⚠️ " + escapeHTML(i18n.T("startup.maxmind_unavailable"))
+	}
+	b.WriteString(tableRow("🌍 "+i18n.T("startup.maxmind"), maxmind))
+	b.WriteString("</table>")
+
+	b.WriteString("<footer>" + escapeHTML(i18n.T("startup.settings_hint")) + "</footer>")
 
 	return b.String()
 }
 
-func formatGroupingLine(limit, subnetGroups, ipCount, asnCount int, subnetEnabled bool, asnGroups int, asnEnabled bool) string {
-	var base string
-	switch {
-	case asnEnabled:
-		base = fmt.Sprintf("%s: %d | %s: %d | %s: %d IP",
-			i18n.T("alert.limit"), limit,
-			i18n.T("alert.asn_groups"), asnGroups,
-			i18n.T("alert.detected_ips"), ipCount)
-	case subnetEnabled && subnetGroups > 0 && subnetGroups < ipCount:
-		base = fmt.Sprintf("%s: %d | %s: %d | %s: %d IP",
-			i18n.T("alert.limit"), limit,
-			i18n.T("alert.subnets"), subnetGroups,
-			i18n.T("alert.detected_ips"), ipCount)
-	default:
-		base = fmt.Sprintf("%s: %d | %s: %d IP",
-			i18n.T("alert.limit"), limit,
-			i18n.T("alert.detected_ips"), ipCount)
+func onOff(v bool) string {
+	if v {
+		return "✅ " + escapeHTML(i18n.T("startup.enabled"))
 	}
-
-	if !asnEnabled && asnCount > 0 {
-		base += fmt.Sprintf(" (%d %s)", asnCount, i18n.T("alert.asn_count"))
-	}
-
-	return base + "\n"
+	return "⬜ " + escapeHTML(i18n.T("startup.disabled"))
 }
 
 func escapeHTML(s string) string {

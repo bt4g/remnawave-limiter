@@ -8,10 +8,16 @@ import (
 
 	"github.com/remnawave/limiter/internal/api"
 	"github.com/remnawave/limiter/internal/i18n"
+	"unicode/utf8"
 )
 
 func init() {
 	i18n.SetLanguage("ru")
+}
+
+// row — ожидаемая строка таблицы «заголовок | значение» в rich HTML.
+func row(header, value string) string {
+	return tableRow(header, value)
 }
 
 func TestFormatManualAlert(t *testing.T) {
@@ -29,28 +35,26 @@ func TestFormatManualAlert(t *testing.T) {
 		{IP: "3.3.3.3", NodeName: "Node-NL", NodeUUID: "n3", ASN: 24940, ASNOrg: "Hetzner Online GmbH"},
 		{IP: "4.4.4.4", NodeName: "Node-DE", NodeUUID: "n1"},
 	}
-	limit := 3
 
-	result := FormatManualAlert(user, ips, limit, 5, loc, 0, false, 0, false)
+	result := FormatManualAlert(user, ips, 3, 5, loc, 0, false, 0, false)
 
 	checks := []struct {
 		name string
 		want string
 	}{
-		{"contains title", "Превышение лимита устройств"},
-		{"contains username", "<code>testuser</code>"},
-		{"contains limit", "3"},
-		{"contains ip count", "4 IP"},
-		{"contains asn count", "4 IP (2 ASN)"},
-		{"contains ip1 link", "https://ipinfo.io/1.1.1.1"},
-		{"contains ip1 asn org", "Cloudflare, Inc."},
-		{"contains ip3 asn org", "Hetzner Online GmbH"},
-		{"contains node1", "(Node-DE)"},
-		{"contains node2", "(Node-US)"},
-		{"contains node3", "(Node-NL)"},
-		{"contains subscription link", "https://example.com/sub/123"},
-		{"contains profile link", "Профиль"},
-		{"contains violation count", "Нарушений за 24ч: 5"},
+		{"heading", "<h3>⚠️ Превышение лимита устройств</h3>"},
+		{"username", row("👤 Пользователь", "<code>testuser</code>")},
+		{"limit", row("📊 Лимит", "<b>3</b>")},
+		{"detected with asn count", row("📡 Обнаружено", "4 IP · 2 ASN")},
+		{"overflow", row("🚦 Превышение", "<mark>+1</mark>")},
+		{"violations", row("📈 Нарушений за 24ч", "5")},
+		{"subscription link", `<a href="https://example.com/sub/123">открыть</a>`},
+		{"time is tg-time", `<tg-time unix="`},
+		{"ip table open", "<details open><summary>📍 IP-адреса (4)</summary>"},
+		{"ip1 link", `<a href="https://ipinfo.io/1.1.1.1">1.1.1.1</a>`},
+		{"ip1 row", "<td>Cloudflare, Inc.</td><td>Node-DE</td>"},
+		{"ip without asn", "<td>—</td><td>Node-US</td>"},
+		{"ip3 org", "<td>Hetzner Online GmbH</td><td>Node-NL</td>"},
 	}
 	for _, c := range checks {
 		t.Run(c.name, func(t *testing.T) {
@@ -59,46 +63,40 @@ func TestFormatManualAlert(t *testing.T) {
 			}
 		})
 	}
-	if strings.Contains(result, "нода:") {
-		t.Errorf("result must not contain old 'нода:' label, got:\n%s", result)
-	}
+	assertBalancedHTML(t, result)
 }
 
-func TestFormatManualAlert_IPWithoutASN_OmitsASNPart(t *testing.T) {
-	loc := time.UTC
+func TestFormatManualAlert_NoOverflowRowWithinLimit(t *testing.T) {
 	user := &api.CachedUser{UserID: 1, Username: "u"}
 	ips := []api.ActiveIP{{IP: "10.0.0.1", NodeName: "Local", NodeUUID: "n"}}
 
-	result := FormatManualAlert(user, ips, 1, 1, loc, 0, false, 0, false)
+	result := FormatManualAlert(user, ips, 1, 1, time.UTC, 0, false, 0, false)
 
-	if !strings.Contains(result, "10.0.0.1</a> (Local)") {
-		t.Errorf("expected IP line without ASN part, got:\n%s", result)
-	}
-	if strings.Contains(result, " - ") {
-		t.Errorf("no ASN means no ' - ' separator, got:\n%s", result)
+	if strings.Contains(result, "Превышение</th>") {
+		t.Errorf("count within limit must not show overflow row, got:\n%s", result)
 	}
 }
 
-func TestFormatManualAlert_IPWithASN_IncludesOrgDashFormat(t *testing.T) {
-	loc := time.UTC
+func TestFormatManualAlert_IPRowsCapped(t *testing.T) {
 	user := &api.CachedUser{UserID: 1, Username: "u"}
-	ips := []api.ActiveIP{{IP: "1.2.3.4", NodeName: "Chicago-1", NodeUUID: "n", ASN: 13335, ASNOrg: "Cloudflare, Inc."}}
+	ips := make([]api.ActiveIP, maxIPRows+5)
+	for i := range ips {
+		ips[i] = api.ActiveIP{IP: fmt.Sprintf("10.0.0.%d", i), NodeName: "N"}
+	}
 
-	result := FormatManualAlert(user, ips, 1, 1, loc, 0, false, 0, false)
+	result := FormatManualAlert(user, ips, 1, 1, time.UTC, 0, false, 0, false)
 
-	wantSubstr := "1.2.3.4</a> - Cloudflare, Inc. (Chicago-1)"
-	if !strings.Contains(result, wantSubstr) {
-		t.Errorf("expected line to contain %q, got:\n%s", wantSubstr, result)
+	if got := strings.Count(result, "https://ipinfo.io/"); got != maxIPRows {
+		t.Errorf("expected %d IP rows, got %d", maxIPRows, got)
+	}
+	if !strings.Contains(result, "… и ещё 5") {
+		t.Errorf("expected remainder row, got:\n%s", result)
 	}
 }
 
 func TestFormatAutoAlert(t *testing.T) {
 	loc := time.UTC
-	user := &api.CachedUser{
-		UserID:   5678,
-		Username: "autouser",
-		Email:    "auto@example.com",
-	}
+	user := &api.CachedUser{UserID: 5678, Username: "autouser", Email: "auto@example.com"}
 	ips := []api.ActiveIP{
 		{IP: "5.5.5.5", NodeName: "Node-FR", NodeUUID: "n5"},
 		{IP: "6.6.6.6", NodeName: "Node-UK", NodeUUID: "n6"},
@@ -107,11 +105,13 @@ func TestFormatAutoAlert(t *testing.T) {
 	result := FormatAutoAlert(user, ips, 2, 30, 3, loc, 0, false, 0, false)
 
 	checks := []struct{ name, want string }{
-		{"contains auto title", "автоматически отключена"},
-		{"contains username", "<code>autouser</code>"},
-		{"contains duration", "30 мин"},
-		{"contains ip link", "https://ipinfo.io/5.5.5.5"},
-		{"contains violation count", "Нарушений за 24ч: 3"},
+		{"auto title", "<h3>🔒 Подписка автоматически отключена</h3>"},
+		{"username", "<code>autouser</code>"},
+		{"duration", row("⏱ Отключена на", "30 мин")},
+		{"restore time", "🔓 Включится</th><td><tg-time"},
+		{"ip link", "https://ipinfo.io/5.5.5.5"},
+		{"violations", row("📈 Нарушений за 24ч", "3")},
+		{"ip list collapsed", "<details><summary>"},
 	}
 	for _, c := range checks {
 		t.Run(c.name, func(t *testing.T) {
@@ -120,35 +120,56 @@ func TestFormatAutoAlert(t *testing.T) {
 			}
 		})
 	}
+	assertBalancedHTML(t, result)
 }
 
 func TestFormatAutoAlert_Permanent(t *testing.T) {
-	loc := time.UTC
 	user := &api.CachedUser{UserID: 9, Username: "permuser"}
 	ips := []api.ActiveIP{{IP: "7.7.7.7", NodeName: "Node-JP", NodeUUID: "n7"}}
 
-	result := FormatAutoAlert(user, ips, 1, 0, 1, loc, 0, false, 0, false)
+	result := FormatAutoAlert(user, ips, 1, 0, 1, time.UTC, 0, false, 0, false)
 
-	if !strings.Contains(result, "Перманентно") {
-		t.Errorf("expected 'Перманентно' for duration=0, got:\n%s", result)
+	if !strings.Contains(result, row("⏱ Отключена на", "<b>Перманентно</b>")) {
+		t.Errorf("expected permanent row for duration=0, got:\n%s", result)
 	}
+	if strings.Contains(result, "Включится") {
+		t.Errorf("permanent disable must not show a restore time, got:\n%s", result)
+	}
+}
+
+func TestFormatSoftAlert(t *testing.T) {
+	user := &api.CachedUser{UserID: 9, Username: "soft"}
+	ips := []api.ActiveIP{{IP: "7.7.7.7", NodeName: "N"}, {IP: "8.8.8.8", NodeName: "N"}}
+
+	result := FormatSoftAlert(user, ips, 1, 3, time.UTC, 0, false, 0, false)
+
+	for _, want := range []string{
+		"<h3>🔔 Превышение лимита в пределах допуска</h3>",
+		row("🚫 Порог бана", "3"),
+		"<blockquote>ℹ️ Бан не применён — превышение в пределах допуска</blockquote>",
+	} {
+		if !strings.Contains(result, want) {
+			t.Errorf("expected %q, got:\n%s", want, result)
+		}
+	}
+	assertBalancedHTML(t, result)
 }
 
 func TestFormatManualAlert_English(t *testing.T) {
 	i18n.SetLanguage("en")
 	defer i18n.SetLanguage("ru")
 
-	loc := time.UTC
 	user := &api.CachedUser{UserID: 7, Username: "enuser"}
 	ips := []api.ActiveIP{{IP: "8.8.8.8", NodeName: "Node-US", NodeUUID: "n8"}}
 
-	result := FormatManualAlert(user, ips, 2, 1, loc, 0, false, 0, false)
+	result := FormatManualAlert(user, ips, 2, 1, time.UTC, 0, false, 0, false)
 
 	checks := []struct{ name, want string }{
 		{"en title", "Device limit exceeded"},
-		{"en user", "User"},
-		{"en violations", "Violations in 24h: 1"},
+		{"en user", "👤 User"},
+		{"en violations", row("📈 Violations in 24h", "1")},
 		{"en ips header", "IP addresses"},
+		{"en provider column", "Provider"},
 	}
 	for _, c := range checks {
 		t.Run(c.name, func(t *testing.T) {
@@ -160,7 +181,6 @@ func TestFormatManualAlert_English(t *testing.T) {
 }
 
 func TestFormatManualAlert_SubnetGroupingHeader(t *testing.T) {
-	loc := time.UTC
 	user := &api.CachedUser{UserID: 1, Username: "u"}
 	ips := []api.ActiveIP{
 		{IP: "1.1.1.1", NodeName: "A", NodeUUID: "n", ASN: 13335},
@@ -168,48 +188,35 @@ func TestFormatManualAlert_SubnetGroupingHeader(t *testing.T) {
 		{IP: "2.2.2.2", NodeName: "A", NodeUUID: "n", ASN: 24940},
 	}
 
-	result := FormatManualAlert(user, ips, 3, 1, loc, 2, true, 0, false)
+	result := FormatManualAlert(user, ips, 1, 1, time.UTC, 2, true, 0, false)
 
-	if !strings.Contains(result, "Подсетей: 2") {
-		t.Errorf("expected 'Подсетей: 2' in header, got:\n%s", result)
+	if !strings.Contains(result, row("🌐 Подсетей", "<b>2</b>")) {
+		t.Errorf("expected subnet row, got:\n%s", result)
 	}
-	if !strings.Contains(result, "3 IP (2 ASN)") {
-		t.Errorf("expected '3 IP (2 ASN)' in header, got:\n%s", result)
+	if !strings.Contains(result, "3 IP · 2 ASN") {
+		t.Errorf("expected '3 IP · 2 ASN', got:\n%s", result)
+	}
+	// Превышение считается по подсетям, а не по IP.
+	if !strings.Contains(result, "<mark>+1</mark>") {
+		t.Errorf("expected overflow computed from subnets, got:\n%s", result)
 	}
 }
 
 func TestFormatManualAlert_NoASN_OmitsCount(t *testing.T) {
-	loc := time.UTC
 	user := &api.CachedUser{UserID: 1, Username: "u"}
 	ips := []api.ActiveIP{
 		{IP: "1.1.1.1", NodeName: "A", NodeUUID: "n"},
 		{IP: "2.2.2.2", NodeName: "A", NodeUUID: "n"},
 	}
 
-	result := FormatManualAlert(user, ips, 1, 1, loc, 0, false, 0, false)
+	result := FormatManualAlert(user, ips, 1, 1, time.UTC, 0, false, 0, false)
 
-	if strings.Contains(result, "ASN)") {
-		t.Errorf("ASN count suffix must be omitted when no IP has ASN, got:\n%s", result)
-	}
-}
-
-func TestFormatAutoAlert_ASNCount(t *testing.T) {
-	loc := time.UTC
-	user := &api.CachedUser{UserID: 9, Username: "autouser"}
-	ips := []api.ActiveIP{
-		{IP: "5.5.5.5", NodeName: "Node-FR", NodeUUID: "n5", ASN: 13335},
-		{IP: "6.6.6.6", NodeName: "Node-UK", NodeUUID: "n6", ASN: 24940},
-	}
-
-	result := FormatAutoAlert(user, ips, 2, 30, 3, loc, 0, false, 0, false)
-
-	if !strings.Contains(result, "2 IP (2 ASN)") {
-		t.Errorf("expected '2 IP (2 ASN)' in auto alert header, got:\n%s", result)
+	if strings.Contains(result, " ASN<") || strings.Contains(result, "· 0") {
+		t.Errorf("ASN count must be omitted when no IP has ASN, got:\n%s", result)
 	}
 }
 
 func TestFormatManualAlert_ASNGroupingHeader(t *testing.T) {
-	loc := time.UTC
 	user := &api.CachedUser{UserID: 1, Username: "u"}
 	ips := []api.ActiveIP{
 		{IP: "1.1.1.1", NodeName: "A", NodeUUID: "n", ASN: 13335},
@@ -217,28 +224,24 @@ func TestFormatManualAlert_ASNGroupingHeader(t *testing.T) {
 		{IP: "2.2.2.2", NodeName: "A", NodeUUID: "n", ASN: 24940},
 	}
 
-	result := FormatManualAlert(user, ips, 9, 1, loc, 0, false, 2, true)
+	result := FormatManualAlert(user, ips, 9, 1, time.UTC, 0, false, 2, true)
 
-	if !strings.Contains(result, "ASN-групп: 2") {
-		t.Errorf("expected 'ASN-групп: 2' in header, got:\n%s", result)
+	if !strings.Contains(result, row("🛰 ASN-групп", "<b>2</b>")) {
+		t.Errorf("expected ASN groups row, got:\n%s", result)
 	}
-	if !strings.Contains(result, "3 IP") {
-		t.Errorf("expected '3 IP' in header, got:\n%s", result)
-	}
-	if strings.Contains(result, "(2 ASN)") {
-		t.Errorf("ASN-mode header must not also append '(N ASN)', got:\n%s", result)
+	if !strings.Contains(result, row("📡 Обнаружено", "3 IP")) {
+		t.Errorf("ASN mode must not append the ASN count to detected IPs, got:\n%s", result)
 	}
 }
 
 func TestFormatManualAlert_SubnetGroupingDisabled_NoSubnetLine(t *testing.T) {
-	loc := time.UTC
 	user := &api.CachedUser{UserID: 1, Username: "u"}
 	ips := []api.ActiveIP{{IP: "1.1.1.1", NodeName: "A", NodeUUID: "n"}}
 
-	result := FormatManualAlert(user, ips, 1, 1, loc, 0, false, 0, false)
+	result := FormatManualAlert(user, ips, 1, 1, time.UTC, 0, false, 0, false)
 
 	if strings.Contains(result, "Подсетей") {
-		t.Errorf("subnetEnabled=false must not show 'Подсетей' in header, got:\n%s", result)
+		t.Errorf("subnetEnabled=false must not show subnets, got:\n%s", result)
 	}
 }
 
@@ -402,18 +405,20 @@ func TestEscapeHTML_EscapesQuote(t *testing.T) {
 	}
 }
 
-func TestWriteIPList_EscapesHostileValues(t *testing.T) {
-	var b strings.Builder
-	writeIPList(&b, []api.ActiveIP{
+func TestIPTable_EscapesHostileValues(t *testing.T) {
+	user := &api.CachedUser{UserID: 1, Username: `<tg-button type="callback_data" data="disable:1">x</tg-button>`}
+	out := FormatManualAlert(user, []api.ActiveIP{
 		{IP: `1.1.1.1" onmouseover="x`, NodeName: `DE<1>`, ASNOrg: `Acme "ISP"`},
-	})
-	out := b.String()
+	}, 1, 1, time.UTC, 0, false, 0, false)
 
 	if strings.Contains(out, `" onmouseover="`) {
 		t.Errorf("unescaped quote leaked into markup: %s", out)
 	}
 	if strings.Contains(out, "<1>") {
 		t.Errorf("unescaped angle brackets leaked into markup: %s", out)
+	}
+	if strings.Contains(out, "<tg-button") {
+		t.Errorf("username injected a button into the alert: %s", out)
 	}
 }
 
@@ -440,5 +445,30 @@ func TestTruncateAnswer(t *testing.T) {
 	// Telegram считает лимит в символах, а не байтах — режем по рунам.
 	if runes := []rune(got); len(runes) > callbackAnswerMaxLen {
 		t.Errorf("truncateAnswer returned %d runes, want <= %d", len(runes), callbackAnswerMaxLen)
+	}
+}
+
+// Срез по байтам разрезал бы многобайтный символ: результат обязан оставаться
+// валидным UTF-8 и считаться в символах.
+func TestTruncateASNOrg_MultibyteSafe(t *testing.T) {
+	cyr40 := strings.Repeat("Ж", 40)
+	if got := truncateASNOrg(cyr40); got != cyr40 {
+		t.Errorf("40 кириллических символов должны проходить без обрезки, получено %q", got)
+	}
+	for _, in := range []string{
+		strings.Repeat("Ж", 41),
+		strings.Repeat("a", 38) + "ÔÔÔ tail",
+		"Telefônica Brasil S.A — Пример очень длинного названия",
+	} {
+		got := truncateASNOrg(in)
+		if !utf8.ValidString(got) {
+			t.Errorf("truncateASNOrg(%q) дал невалидный UTF-8: %q", in, got)
+		}
+		if n := utf8.RuneCountInString(got); n > asnOrgMaxLen {
+			t.Errorf("truncateASNOrg(%q) длиннее %d символов: %d", in, asnOrgMaxLen, n)
+		}
+		if !strings.HasSuffix(got, "…") {
+			t.Errorf("truncateASNOrg(%q) = %q, ожидалось многоточие", in, got)
+		}
 	}
 }

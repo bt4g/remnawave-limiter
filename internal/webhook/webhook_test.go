@@ -244,3 +244,56 @@ func TestClient_Send_CancelledContext_StopsRetrying(t *testing.T) {
 		t.Errorf("expected no calls with cancelled context, got %d", calls)
 	}
 }
+
+// X-Signature-V2 подписывает "<X-Timestamp>.<тело>": запрос, переигранный
+// с новым X-Timestamp, проверку не пройдёт.
+func TestClient_Send_SignatureV2CoversTimestamp(t *testing.T) {
+	const secret = "my-secret-123"
+	var gotSig, gotTS string
+	var gotBody []byte
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSig = r.Header.Get("X-Signature-V2")
+		gotTS = r.Header.Get("X-Timestamp")
+		gotBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	NewClient(srv.URL, secret, testLogger()).Send(context.Background(), testPayload())
+
+	sign := func(ts string) string {
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write([]byte(ts + "."))
+		mac.Write(gotBody)
+		return "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	}
+	if gotTS == "" || gotSig != sign(gotTS) {
+		t.Fatalf("X-Signature-V2 %q не совпадает с HMAC(timestamp.body) %q", gotSig, sign(gotTS))
+	}
+	if gotSig == sign("1") {
+		t.Error("подпись не должна совпадать при другом timestamp")
+	}
+}
+
+func TestClient_Send_RawSecretHeaderCanBeDisabled(t *testing.T) {
+	var hasSecret, hasSig bool
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, hasSecret = r.Header["X-Webhook-Secret"]
+		hasSig = r.Header.Get("X-Signature") != "" && r.Header.Get("X-Signature-V2") != ""
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL, "my-secret-123", testLogger())
+	client.SetRawSecretHeader(false)
+	client.Send(context.Background(), testPayload())
+
+	if hasSecret {
+		t.Error("при SetRawSecretHeader(false) секрет не должен уходить в заголовке")
+	}
+	if !hasSig {
+		t.Error("подписи должны отправляться и без X-Webhook-Secret")
+	}
+}

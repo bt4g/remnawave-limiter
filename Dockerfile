@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 # Пусто по умолчанию: тогда версия берётся из internal/version/version.go.
 # Значение вроде "dev" здесь перетирало бы её при любой сборке без --build-arg.
@@ -20,7 +20,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
         -ldflags="-s -w ${VERSION:+-X github.com/remnawave/limiter/internal/version.Version=$VERSION}" \
         -o /bin/remnawave-limiter ./cmd/limiter/
 
-FROM alpine:3.23
+FROM alpine:3.24
 
 # ca-certificates — HTTPS к панели и MaxMind, tzdata — TIMEZONE,
 # wget — healthcheck в docker-compose.

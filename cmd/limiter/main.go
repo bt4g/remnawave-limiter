@@ -124,13 +124,27 @@ func run() int {
 	if overrides, err := redisCache.GetConfigOverrides(ctx); err != nil {
 		logger.WithError(err).Warn("Не удалось загрузить сохранённые настройки из Redis, использую .env")
 	} else if len(overrides) > 0 {
-		if merged, err := config.LoadConfigWithOverrides("", overrides); err != nil {
-			logger.WithError(err).Error("Сохранённые настройки невалидны, игнорирую их и использую .env")
+		merged, applied, rejected, err := config.MergeSavedOverrides("", overrides)
+		if err != nil {
+			logger.WithError(err).Error("Не удалось применить сохранённые настройки, использую .env")
 		} else {
+			// Отброшенные значения удаляются из Redis: иначе бот показывал бы
+			// «всё из .env», а они продолжали бы мешать новым настройкам.
+			for key, reason := range rejected {
+				logger.WithError(reason).WithFields(logrus.Fields{
+					"key":   key,
+					"value": overrides[key],
+				}).Warn("Сохранённая настройка невалидна и удалена — задайте её заново через /settings")
+				if err := redisCache.DeleteConfigOverride(ctx, key); err != nil {
+					logger.WithError(err).WithField("key", key).Warn("Не удалось удалить невалидную настройку из Redis")
+				}
+			}
 			cfg = merged
-			appliedOverrides = overrides
+			appliedOverrides = applied
 			applyLogSettings(logger, cfg)
-			logger.Infof("Применены сохранённые настройки из бота: %d параметр(ов)", len(overrides))
+			if len(applied) > 0 {
+				logger.Infof("Применены сохранённые настройки из бота: %d параметр(ов)", len(applied))
+			}
 		}
 	}
 
@@ -177,6 +191,7 @@ func run() int {
 	var webhookClient *webhook.Client
 	if cfg.WebhookURL != "" {
 		webhookClient = webhook.NewClient(cfg.WebhookURL, cfg.WebhookSecret, logger)
+		webhookClient.SetRawSecretHeader(cfg.WebhookSecretHeader)
 		logger.Info("Webhook включён")
 	}
 
@@ -190,34 +205,7 @@ func run() int {
 	bot.SetSettingsProvider(settingsMgr)
 	bot.SetStatsHandler(mon.StatsText)
 
-	bot.SetActionHandler(func(ctx context.Context, action string, userID int64) error {
-		switch action {
-		case "drop":
-			return apiClient.DropConnections(ctx, []int64{userID})
-		case "disable":
-			return apiClient.DisableUser(ctx, userID)
-		case "disable_temp":
-			if err := apiClient.DisableUser(ctx, userID); err != nil {
-				return err
-			}
-			if dur := cfgProvider.Load().AutoDisableDuration; dur > 0 {
-				duration := time.Duration(dur) * time.Minute
-				if err := redisCache.SetRestoreTimer(ctx, userID, duration); err != nil {
-					logger.WithError(err).WithField("userID", userID).Error("Ошибка установки таймера восстановления (manual disable_temp)")
-					return err
-				}
-			}
-			return nil
-		case "enable":
-			return apiClient.EnableUser(ctx, userID)
-		case "ignore":
-			return redisCache.AddToWhitelist(ctx, userID)
-		case "ignore_temp":
-			ttl := time.Duration(cfgProvider.Load().IgnoreDuration) * time.Minute
-			return redisCache.AddToWhitelistTemp(ctx, userID, ttl)
-		}
-		return nil
-	})
+	bot.SetActionHandler(newActionHandler(apiClient, redisCache, cfgProvider, logger))
 
 	if cfg.ASNGrouping && cfg.SubnetGrouping {
 		logger.Warn("Включены оба режима ASN_GROUPING и SUBNET_GROUPING — приоритет у ASN, подсети будут игнорироваться")

@@ -19,7 +19,7 @@ func clearEnv() {
 		"REDIS_URL",
 		"TIMEZONE",
 		"LANGUAGE",
-		"WEBHOOK_URL", "WEBHOOK_SECRET",
+		"WEBHOOK_URL", "WEBHOOK_SECRET", "WEBHOOK_SECRET_HEADER",
 		"SUBNET_GROUPING",
 		"SUBNET_PREFIX_V4",
 		"ASN_GROUPING",
@@ -754,5 +754,83 @@ func TestLoadConfig_RedisURL_Invalid(t *testing.T) {
 
 	if _, err := LoadConfig(""); err == nil {
 		t.Error("expected error for non-redis REDIS_URL, got nil")
+	}
+}
+
+func TestValidate_ToleranceMultiplierMustBeFiniteAndBounded(t *testing.T) {
+	for _, raw := range []string{"NaN", "nan", "Inf", "+Inf", "-Inf", "1e300", "101", "-0.5"} {
+		clearEnv()
+		setRequiredEnv()
+		os.Setenv("TOLERANCE_MULTIPLIER", raw)
+		if _, err := LoadConfig(""); err == nil {
+			t.Errorf("TOLERANCE_MULTIPLIER=%s должен отклоняться", raw)
+		}
+	}
+	for _, raw := range []string{"0", "0.5", "100"} {
+		clearEnv()
+		setRequiredEnv()
+		os.Setenv("TOLERANCE_MULTIPLIER", raw)
+		if _, err := LoadConfig(""); err != nil {
+			t.Errorf("TOLERANCE_MULTIPLIER=%s должен приниматься: %v", raw, err)
+		}
+	}
+	clearEnv()
+}
+
+func TestValidate_ViolationThresholdMustBeReachable(t *testing.T) {
+	cases := []struct {
+		name                                  string
+		threshold, cooldown, interval, window string
+		wantErr                               bool
+	}{
+		{"порог 1 — проверки нет", "1", "3600", "30", "60", false},
+		{"значения по умолчанию", "3", "300", "30", "3600", false},
+		{"кулдаун равен окну", "2", "3600", "30", "3600", true},
+		{"кулдаун больше окна", "5", "3600", "30", "600", true},
+		{"впритык не укладывается", "3", "300", "30", "660", true},
+		{"укладывается", "3", "300", "30", "661", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			clearEnv()
+			setRequiredEnv()
+			defer clearEnv()
+			os.Setenv("VIOLATION_THRESHOLD", c.threshold)
+			os.Setenv("COOLDOWN", c.cooldown)
+			os.Setenv("CHECK_INTERVAL", c.interval)
+			os.Setenv("VIOLATION_THRESHOLD_WINDOW", c.window)
+			os.Setenv("ACTIVE_IP_WINDOW", "600")
+
+			_, err := LoadConfig("")
+			if (err != nil) != c.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, c.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), "VIOLATION_THRESHOLD") {
+				t.Errorf("ошибка должна называть параметр: %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_WebhookSecretHeaderDefaultsOn(t *testing.T) {
+	clearEnv()
+	setRequiredEnv()
+	defer clearEnv()
+
+	cfg, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.WebhookSecretHeader {
+		t.Error("WEBHOOK_SECRET_HEADER по умолчанию включён ради совместимости")
+	}
+
+	os.Setenv("WEBHOOK_SECRET_HEADER", "false")
+	cfg, err = LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebhookSecretHeader {
+		t.Error("WEBHOOK_SECRET_HEADER=false должен отключать заголовок")
 	}
 }

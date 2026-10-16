@@ -111,7 +111,13 @@ func (c *Cache) AddToWhitelist(ctx context.Context, userID int64) error {
 	return c.client.SAdd(ctx, keyWhitelist, formatUserID(userID)).Err()
 }
 
+// AddToWhitelistTemp временно исключает пользователя из проверки. Нулевой TTL
+// в Redis означает «без срока», и временный whitelist молча стал бы вечным
+// (причём вне множества whitelist, где его не видно), поэтому он запрещён.
 func (c *Cache) AddToWhitelistTemp(ctx context.Context, userID int64, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("временный whitelist требует положительный TTL, получено %v", ttl)
+	}
 	return c.client.Set(ctx, prefixWhitelistTemp+formatUserID(userID), "1", ttl).Err()
 }
 
@@ -167,6 +173,20 @@ func (c *Cache) SetRestoreTimer(ctx context.Context, userID int64, duration time
 		Score:  expiry,
 		Member: formatUserID(userID),
 	}).Err()
+}
+
+// RemoveRestoreTimer снимает запланированное автовключение пользователя и
+// сбрасывает счётчик попыток. Нужен, когда админ включил пользователя раньше
+// срока или отключил навсегда: иначе старый таймер включил бы его снова.
+func (c *Cache) RemoveRestoreTimer(ctx context.Context, userID int64) error {
+	id := formatUserID(userID)
+	pipe := c.client.TxPipeline()
+	pipe.ZRem(ctx, keyRestoreQ, id)
+	pipe.Del(ctx, prefixRestoreAttempts+id)
+	if _, err := pipe.Exec(ctx); err != nil {
+		return fmt.Errorf("remove restore timer: %w", err)
+	}
+	return nil
 }
 
 var popExpiredRestore = redis.NewScript(`

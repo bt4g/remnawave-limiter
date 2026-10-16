@@ -29,6 +29,11 @@ type Client struct {
 	httpClient *http.Client
 	logger     *logrus.Logger
 	retryDelay time.Duration
+
+	// rawSecretHeader — слать ли сам секрет в X-Webhook-Secret. Включено ради
+	// совместимости со старыми получателями; кто видел один запрос, узнаёт
+	// секрет и может подписать что угодно, поэтому лучше проверять подпись.
+	rawSecretHeader bool
 }
 
 func NewClient(url, secret string, logger *logrus.Logger) *Client {
@@ -49,9 +54,24 @@ func NewClient(url, secret string, logger *logrus.Logger) *Client {
 				TLSHandshakeTimeout: 10 * time.Second,
 			},
 		},
-		logger:     logger,
-		retryDelay: defaultRetryDelay,
+		logger:          logger,
+		retryDelay:      defaultRetryDelay,
+		rawSecretHeader: true,
 	}
+}
+
+// SetRawSecretHeader включает или отключает заголовок X-Webhook-Secret.
+func (c *Client) SetRawSecretHeader(enabled bool) {
+	c.rawSecretHeader = enabled
+}
+
+// sign возвращает HMAC-SHA256 сообщения в формате "sha256=<hex>".
+func (c *Client) sign(parts ...[]byte) string {
+	mac := hmac.New(sha256.New, []byte(c.secret))
+	for _, p := range parts {
+		mac.Write(p)
+	}
+	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
 func (c *Client) Send(ctx context.Context, payload *Payload) {
@@ -63,11 +83,13 @@ func (c *Client) Send(ctx context.Context, payload *Payload) {
 
 	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
 
-	var signature string
+	// X-Signature подписывает только тело, поэтому старый запрос можно
+	// переиграть с новым X-Timestamp. X-Signature-V2 подписывает
+	// "<timestamp>.<тело>" — по нему получатель отбрасывает повторы.
+	var sigs signatures
 	if c.secret != "" {
-		mac := hmac.New(sha256.New, []byte(c.secret))
-		mac.Write(data)
-		signature = "sha256=" + hex.EncodeToString(mac.Sum(nil))
+		sigs.body = c.sign(data)
+		sigs.timestamped = c.sign([]byte(timestamp), []byte("."), data)
 	}
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
@@ -79,7 +101,7 @@ func (c *Client) Send(ctx context.Context, payload *Payload) {
 			}
 		}
 
-		retry, err := c.attempt(ctx, data, timestamp, signature)
+		retry, err := c.attempt(ctx, data, timestamp, sigs)
 		if err == nil {
 			return
 		}
@@ -97,7 +119,12 @@ func (c *Client) Send(ctx context.Context, payload *Payload) {
 	c.logger.WithField("event", payload.Event).Error("Webhook не доставлен: попытки исчерпаны")
 }
 
-func (c *Client) attempt(ctx context.Context, data []byte, timestamp, signature string) (bool, error) {
+type signatures struct {
+	body        string
+	timestamped string
+}
+
+func (c *Client) attempt(ctx context.Context, data []byte, timestamp string, sigs signatures) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(data))
 	if err != nil {
 		return false, err
@@ -107,8 +134,11 @@ func (c *Client) attempt(ctx context.Context, data []byte, timestamp, signature 
 	req.Header.Set("User-Agent", "remnawave-limiter")
 	req.Header.Set("X-Timestamp", timestamp)
 	if c.secret != "" {
-		req.Header.Set("X-Webhook-Secret", c.secret)
-		req.Header.Set("X-Signature", signature)
+		if c.rawSecretHeader {
+			req.Header.Set("X-Webhook-Secret", c.secret)
+		}
+		req.Header.Set("X-Signature", sigs.body)
+		req.Header.Set("X-Signature-V2", sigs.timestamped)
 	}
 
 	resp, err := c.httpClient.Do(req)

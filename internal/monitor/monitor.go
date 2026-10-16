@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +33,10 @@ const (
 	maxRestoreAttempts = 3
 
 	webhookGracePeriod = 15 * time.Second
+
+	// maxTolerance ограничивает допуск сверху: при насыщении limit+допуск
+	// гарантированно не переполняет int.
+	maxTolerance = 1 << 30
 )
 
 type Monitor struct {
@@ -334,6 +339,13 @@ func (m *Monitor) checkUser(ctx context.Context, userID int64, activeIPs []api.A
 		}
 	}
 
+	// Группировка по ASN или подсетям может только уменьшить число устройств,
+	// поэтому при числе IP не больше лимита нарушения нет ни в каком режиме —
+	// ASN-поиск и группировку для таких пользователей не делаем.
+	if len(uniqueMap) <= limit {
+		return
+	}
+
 	uniqueIPs := make([]api.ActiveIP, 0, len(uniqueMap))
 	for _, ip := range uniqueMap {
 		uniqueIPs = append(uniqueIPs, ip)
@@ -373,8 +385,7 @@ func (m *Monitor) checkUser(ctx context.Context, userID int64, activeIPs []api.A
 		deviceCount = subnetGroups
 	}
 
-	effectiveTolerance := cfg.Tolerance + int(float64(limit)*cfg.ToleranceMultiplier)
-	banThreshold := limit + effectiveTolerance
+	banThreshold := limit + effectiveTolerance(cfg, limit)
 
 	if deviceCount > banThreshold {
 		m.handleHardViolation(ctx, user, uniqueIPs, limit, deviceCount, subnetGroups, asnGroups, st)
@@ -486,7 +497,7 @@ func (m *Monitor) handleSoftWarning(ctx context.Context, user *api.CachedUser, u
 	m.sendWebhook(ctx, "soft_violation_detected", user, uniqueIPs, limit, 0, subnetGroups, asnGroups)
 
 	text := telegram.FormatSoftAlert(user, uniqueIPs, limit, banThreshold, m.location, subnetGroups, cfg.SubnetGrouping, asnGroups, cfg.ASNGrouping)
-	if err := m.bot.SendMessage(ctx, text); err != nil {
+	if err := m.bot.SendSoftAlert(ctx, text, user.UserID, cfg.IgnoreDuration); err != nil {
 		m.logger.WithError(err).WithField("userID", userID).Error("Ошибка отправки soft alert")
 	}
 }
@@ -532,6 +543,20 @@ func (m *Monitor) getUser(ctx context.Context, userID int64) (*api.CachedUser, e
 	return cu, nil
 }
 
+// effectiveTolerance — допуск сверх лимита: TOLERANCE + floor(limit × TOLERANCE_MULTIPLIER).
+// Считается с насыщением: переполнение int дало бы отрицательный порог,
+// и под бан попали бы все пользователи с подключениями.
+func effectiveTolerance(cfg *config.Config, limit int) int {
+	t := float64(cfg.Tolerance) + math.Floor(float64(limit)*cfg.ToleranceMultiplier)
+	switch {
+	case math.IsNaN(t) || t <= 0:
+		return 0
+	case t >= maxTolerance:
+		return maxTolerance
+	}
+	return int(t)
+}
+
 func (m *Monitor) resolveLimit(cfg *config.Config, hwidDeviceLimit int) int {
 	if hwidDeviceLimit == 0 {
 		return 0
@@ -565,6 +590,11 @@ func (m *Monitor) handleAutoAction(ctx context.Context, user *api.CachedUser, ip
 				"durationMin": cfg.AutoDisableDuration,
 			}).Error("Пользователь отключён, но таймер восстановления не установлен — включите вручную")
 		}
+	} else if err := m.cache.RemoveRestoreTimer(ctx, user.UserID); err != nil {
+		// Отключение навсегда: таймер от прежнего временного отключения иначе
+		// включил бы пользователя обратно.
+		m.logger.WithError(err).WithField("userID", user.UserID).
+			Error("Пользователь отключён навсегда, но старый таймер восстановления не снят — он может включить пользователя")
 	}
 
 	text := telegram.FormatAutoAlert(user, ips, limit, cfg.AutoDisableDuration, violationCount, m.location, subnetGroups, cfg.SubnetGrouping, asnGroups, cfg.ASNGrouping)
@@ -592,7 +622,7 @@ func (m *Monitor) sendWebhook(ctx context.Context, event string, user *api.Cache
 		}
 	}
 
-	effectiveTolerance := cfg.Tolerance + int(float64(limit)*cfg.ToleranceMultiplier)
+	tolerance := effectiveTolerance(cfg, limit)
 	deviceGroupCount := len(ips)
 	groupingMode := "ip"
 	switch {
@@ -622,8 +652,8 @@ func (m *Monitor) sendWebhook(ctx context.Context, event string, user *api.Cache
 			IPs:               ipPayloads,
 			IPCount:           len(ips),
 			DeviceLimit:       limit,
-			Tolerance:         effectiveTolerance,
-			EffectiveLimit:    limit + effectiveTolerance,
+			Tolerance:         tolerance,
+			EffectiveLimit:    limit + tolerance,
 			ViolationCount24h: violationCount,
 			SubnetCount:       subnetGroups,
 			ASNGroupCount:     asnGroups,
@@ -670,7 +700,7 @@ func (m *Monitor) dailyReportLoop(ctx context.Context) {
 			hour, minute = 9, 0
 		}
 
-		timer := time.NewTimer(time.Until(m.nextDailyReport(hour, minute)))
+		timer := time.NewTimer(time.Until(m.nextDailyReport(time.Now(), hour, minute)))
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -685,11 +715,13 @@ func (m *Monitor) dailyReportLoop(ctx context.Context) {
 	}
 }
 
-func (m *Monitor) nextDailyReport(hour, minute int) time.Time {
-	now := time.Now().In(m.location)
+func (m *Monitor) nextDailyReport(now time.Time, hour, minute int) time.Time {
+	now = now.In(m.location)
 	next := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, m.location)
 	if !next.After(now) {
-		next = next.Add(24 * time.Hour)
+		// Следующий календарный день, а не +24ч: в дни перехода на летнее
+		// время и обратно сутки длятся 23 или 25 часов.
+		next = time.Date(now.Year(), now.Month(), now.Day()+1, hour, minute, 0, 0, m.location)
 	}
 	return next
 }
@@ -701,7 +733,7 @@ func (m *Monitor) sendDailyReport(ctx context.Context) {
 		return
 	}
 	text := telegram.FormatDailyReport(stats, m.location)
-	if err := m.bot.SendMessage(ctx, text); err != nil {
+	if err := m.bot.SendStats(ctx, text); err != nil {
 		m.logger.WithError(err).Error("Ошибка отправки ежедневного отчёта")
 	}
 }

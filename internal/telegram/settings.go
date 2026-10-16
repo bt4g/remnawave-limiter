@@ -3,11 +3,12 @@ package telegram
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/mymmrac/telego"
-	tu "github.com/mymmrac/telego/telegoutil"
+	tgbot "github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
 
 	"github.com/remnawave/limiter/internal/i18n"
 )
@@ -48,29 +49,39 @@ func (b *Bot) SetSettingsProvider(p SettingsProvider) {
 const pendingTTL = 5 * time.Minute
 
 type pendingInput struct {
-	key     string
-	chatID  int64
-	expires time.Time
+	key       string
+	chatID    int64
+	messageID int
+	expires   time.Time
 }
 
-func (b *Bot) setPending(adminID int64, key string, chatID int64) {
+func (b *Bot) setPending(adminID int64, key string, chatID int64, messageID int) {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
-	b.pending[adminID] = pendingInput{key: key, chatID: chatID, expires: time.Now().Add(pendingTTL)}
+	b.pending[adminID] = pendingInput{key: key, chatID: chatID, messageID: messageID, expires: time.Now().Add(pendingTTL)}
 }
 
-func (b *Bot) takePending(adminID int64) (pendingInput, bool) {
+// pendingFor возвращает ожидание ввода админа, не снимая его.
+func (b *Bot) pendingFor(adminID int64) (pendingInput, bool) {
 	b.pendingMu.Lock()
 	defer b.pendingMu.Unlock()
 	p, ok := b.pending[adminID]
 	if !ok {
 		return pendingInput{}, false
 	}
-	delete(b.pending, adminID)
 	if time.Now().After(p.expires) {
+		delete(b.pending, adminID)
 		return pendingInput{}, false
 	}
 	return p, true
+}
+
+// keepPending возвращает ожидание после ошибочного ввода с прежним сроком:
+// ошибки не должны продлевать его бесконечно.
+func (b *Bot) keepPending(adminID int64, p pendingInput) {
+	b.pendingMu.Lock()
+	defer b.pendingMu.Unlock()
+	b.pending[adminID] = p
 }
 
 func (b *Bot) clearPending(adminID int64) {
@@ -79,66 +90,340 @@ func (b *Bot) clearPending(adminID int64) {
 	delete(b.pending, adminID)
 }
 
-func (b *Bot) buildMenuKeyboard() *telego.InlineKeyboardMarkup {
-	items := b.settings.Items()
-	rows := make([][]telego.InlineKeyboardButton, 0, len(items)+1)
-	for _, it := range items {
-		marker := ""
-		if it.Overridden {
-			marker = "♻️ "
-		}
-		label := fmt.Sprintf("%s%s: %s", marker, it.Title, it.Display)
-		data := "cfg:edit:" + it.Key
-		if it.Kind == SettingBool {
-			data = "cfg:toggle:" + it.Key
-		}
-		rows = append(rows, []telego.InlineKeyboardButton{
-			tu.InlineKeyboardButton(label).WithCallbackData(data),
-		})
-	}
-	rows = append(rows, []telego.InlineKeyboardButton{
-		tu.InlineKeyboardButton(i18n.T("settings.reset_all")).WithCallbackData("cfg:resetall"),
-	})
-	return &telego.InlineKeyboardMarkup{InlineKeyboard: rows}
+// settingsGroup — раздел меню настроек. Ключи, которых нет ни в одном разделе
+// (например, новые записи реестра), попадают в раздел groupOther.
+type settingsGroup struct {
+	id   string
+	keys []string
 }
 
-func (b *Bot) buildEditKeyboard(it SettingItem) *telego.InlineKeyboardMarkup {
-	rows := make([][]telego.InlineKeyboardButton, 0, 4)
-	if it.Kind == SettingBool || it.Kind == SettingEnum {
-		valRow := make([]telego.InlineKeyboardButton, 0, len(it.Allowed))
-		for _, v := range it.Allowed {
-			label := v
-			if v == it.Display {
-				label = "✅ " + v
+const groupOther = "other"
+
+var settingsGroups = []settingsGroup{
+	{id: "detect", keys: []string{"CHECK_INTERVAL", "ACTIVE_IP_WINDOW", "DEFAULT_DEVICE_LIMIT", "TOLERANCE", "TOLERANCE_MULTIPLIER"}},
+	{id: "actions", keys: []string{"ACTION_MODE", "AUTO_DISABLE_DURATION", "IGNORE_DURATION", "AUTO_NOTIFY_SOFT"}},
+	{id: "thresholds", keys: []string{"COOLDOWN", "VIOLATION_THRESHOLD", "VIOLATION_THRESHOLD_WINDOW"}},
+	{id: "grouping", keys: []string{"ASN_GROUPING", "SUBNET_GROUPING", "SUBNET_PREFIX_V4"}},
+	{id: "service", keys: []string{"USER_CACHE_TTL", "DAILY_REPORT", "LOG_LEVEL"}},
+}
+
+// settingPresets — быстрые значения на экране редактирования числовых параметров.
+// Любое другое значение можно отправить сообщением.
+var settingPresets = map[string][]string{
+	"CHECK_INTERVAL":             {"30", "60", "120", "300"},
+	"ACTIVE_IP_WINDOW":           {"120", "300", "600", "900"},
+	"DEFAULT_DEVICE_LIMIT":       {"0", "1", "2", "3", "5"},
+	"TOLERANCE":                  {"0", "1", "2", "3"},
+	"TOLERANCE_MULTIPLIER":       {"0", "0.25", "0.5", "1"},
+	"AUTO_DISABLE_DURATION":      {"0", "10", "30", "60", "1440"},
+	"IGNORE_DURATION":            {"0", "60", "360", "1440"},
+	"COOLDOWN":                   {"300", "900", "1800", "3600"},
+	"VIOLATION_THRESHOLD":        {"1", "2", "3", "5"},
+	"VIOLATION_THRESHOLD_WINDOW": {"600", "1800", "3600", "7200"},
+	"SUBNET_PREFIX_V4":           {"16", "20", "22", "24"},
+	"USER_CACHE_TTL":             {"60", "300", "600", "1800"},
+}
+
+// minuteKeys показываются вместе с человекочитаемой длительностью; 0 — «навсегда».
+var minuteKeys = map[string]bool{
+	"AUTO_DISABLE_DURATION": true,
+	"IGNORE_DURATION":       true,
+}
+
+func groupOf(key string) string {
+	for _, g := range settingsGroups {
+		for _, k := range g.keys {
+			if k == key {
+				return g.id
 			}
-			valRow = append(valRow, tu.InlineKeyboardButton(label).WithCallbackData("cfg:set:"+it.Key+":"+v))
 		}
-		rows = append(rows, valRow)
 	}
+	return groupOther
+}
+
+type itemGroup struct {
+	id    string
+	items []SettingItem
+}
+
+// groupedItems раскладывает параметры по разделам в порядке меню.
+func groupedItems(items []SettingItem) []itemGroup {
+	byKey := make(map[string]SettingItem, len(items))
+	for _, it := range items {
+		byKey[it.Key] = it
+	}
+	var out []itemGroup
+	used := make(map[string]bool, len(items))
+	for _, g := range settingsGroups {
+		var list []SettingItem
+		for _, k := range g.keys {
+			if it, ok := byKey[k]; ok {
+				list = append(list, it)
+				used[k] = true
+			}
+		}
+		if len(list) > 0 {
+			out = append(out, itemGroup{id: g.id, items: list})
+		}
+	}
+	var rest []SettingItem
+	for _, it := range items {
+		if !used[it.Key] {
+			rest = append(rest, it)
+		}
+	}
+	if len(rest) > 0 {
+		out = append(out, itemGroup{id: groupOther, items: rest})
+	}
+	return out
+}
+
+func groupTitle(id string) string {
+	return i18n.T("settings.group." + id)
+}
+
+// optionalT возвращает перевод или пустую строку, если ключа нет.
+func optionalT(key string) string {
+	if v := i18n.T(key); v != key {
+		return v
+	}
+	return ""
+}
+
+// displayValue — значение параметра в виде rich HTML.
+func displayValue(it SettingItem) string {
+	if it.Kind == SettingBool {
+		if it.Display == "true" {
+			return "✅ " + escapeHTML(i18n.T("settings.on"))
+		}
+		return "⬜ " + escapeHTML(i18n.T("settings.off"))
+	}
+	v := "<code>" + escapeHTML(it.Display) + "</code>"
+	if minuteKeys[it.Key] {
+		if n, err := strconv.Atoi(it.Display); err == nil {
+			v += " · " + escapeHTML(FormatDuration(n))
+		}
+	}
+	return v
+}
+
+func overriddenMark(it SettingItem) string {
 	if it.Overridden {
-		rows = append(rows, []telego.InlineKeyboardButton{
-			tu.InlineKeyboardButton(i18n.T("settings.reset_one")).WithCallbackData("cfg:reset:" + it.Key),
-		})
+		return " ♻️"
 	}
-	rows = append(rows, []telego.InlineKeyboardButton{
-		tu.InlineKeyboardButton(i18n.T("settings.back")).WithCallbackData("cfg:menu"),
+	return ""
+}
+
+// notice — строка-уведомление над содержимым экрана (результат последнего действия).
+type notice struct {
+	text  string
+	isErr bool
+}
+
+func (n notice) html() string {
+	if n.text == "" {
+		return ""
+	}
+	mark := "✅ "
+	if n.isErr {
+		mark = "❌ "
+	}
+	return "<blockquote>" + mark + escapeHTML(n.text) + "</blockquote>"
+}
+
+func (b *Bot) menuScreen(n notice) richMsg {
+	var h strings.Builder
+	items := b.settings.Items()
+
+	h.WriteString("<h3>" + escapeHTML(i18n.T("settings.title")) + "</h3>")
+	h.WriteString(n.html())
+	h.WriteString("<p>" + escapeHTML(i18n.T("settings.intro")) + "</p>")
+
+	overridden := 0
+	h.WriteString("<table bordered striped compact>")
+	for _, g := range groupedItems(items) {
+		h.WriteString("<tr><th colspan=\"2\" align=\"left\">" + escapeHTML(groupTitle(g.id)) + "</th></tr>")
+		for _, it := range g.items {
+			if it.Overridden {
+				overridden++
+			}
+			h.WriteString("<tr><td>" + escapeHTML(it.Title) + "</td><td>" + displayValue(it) + overriddenMark(it) + "</td></tr>")
+		}
+	}
+	h.WriteString("</table>")
+
+	if overridden > 0 {
+		h.WriteString("<footer>" + escapeHTML(fmt.Sprintf(i18n.T("settings.overridden_count"), overridden)) + "</footer>")
+	} else {
+		h.WriteString("<footer>" + escapeHTML(i18n.T("settings.all_from_env")) + "</footer>")
+	}
+
+	var rows [][]richButton
+	var row []richButton
+	for _, g := range groupedItems(items) {
+		row = append(row, cbButton(groupTitle(g.id), "cfg:sec:"+g.id, styleNone))
+		if len(row) == 2 {
+			rows = append(rows, row)
+			row = nil
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+
+	resetBtn := cbButton(i18n.T("settings.reset_all"), "cfg:resetall", styleDanger)
+	if overridden == 0 {
+		resetBtn = disabledButton(i18n.T("settings.reset_all"))
+	}
+	rows = append(rows, []richButton{
+		cbButton(i18n.T("button.stats"), "ui:stats", styleNone),
+		resetBtn,
 	})
-	return &telego.InlineKeyboardMarkup{InlineKeyboard: rows}
+
+	return richMsg{HTML: h.String(), Rows: rows}
 }
 
-func (b *Bot) sendSettingsMenu(ctx context.Context, chatID int64) {
-	msg := tu.Message(tu.ID(chatID), i18n.T("settings.title")).
-		WithParseMode(telego.ModeHTML).
-		WithReplyMarkup(b.buildMenuKeyboard())
-	if b.threadID != 0 && chatID == b.chatID {
-		msg = msg.WithMessageThreadID(int(b.threadID))
+func (b *Bot) sectionScreen(groupID string, n notice) richMsg {
+	var section []SettingItem
+	for _, g := range groupedItems(b.settings.Items()) {
+		if g.id == groupID {
+			section = g.items
+			break
+		}
 	}
-	if _, err := b.api.SendMessage(ctx, msg); err != nil {
-		b.logger.WithError(err).Error("Telegram бот: ошибка отправки меню настроек")
+	if len(section) == 0 {
+		return b.menuScreen(n)
 	}
+
+	var h strings.Builder
+	h.WriteString("<h3>" + escapeHTML(groupTitle(groupID)) + "</h3>")
+	h.WriteString(n.html())
+	if desc := optionalT("settings.group." + groupID + ".desc"); desc != "" {
+		h.WriteString("<p>" + escapeHTML(desc) + "</p>")
+	}
+
+	h.WriteString("<table bordered striped compact><tr>")
+	h.WriteString("<th align=\"left\">" + escapeHTML(i18n.T("settings.col_param")) + "</th>")
+	h.WriteString("<th align=\"left\">" + escapeHTML(i18n.T("settings.col_value")) + "</th>")
+	h.WriteString("</tr>")
+	for _, it := range section {
+		h.WriteString("<tr><td>" + escapeHTML(it.Title) + "</td><td>" + displayValue(it) + overriddenMark(it) + "</td></tr>")
+	}
+	h.WriteString("</table>")
+
+	var hints strings.Builder
+	for _, it := range section {
+		if hint := optionalT("setting_hint." + it.Key); hint != "" {
+			hints.WriteString("<li><b>" + escapeHTML(it.Title) + "</b> — " + escapeHTML(hint) + "</li>")
+		}
+	}
+	if hints.Len() > 0 {
+		h.WriteString("<details><summary>" + escapeHTML(i18n.T("settings.hints")) + "</summary><ul>" + hints.String() + "</ul></details>")
+	}
+
+	rows := make([][]richButton, 0, len(section)+1)
+	for _, it := range section {
+		if it.Kind == SettingBool {
+			if it.Display == "true" {
+				rows = append(rows, []richButton{cbButton("✅ "+it.Title, "cfg:toggle:"+it.Key, styleSuccess)})
+			} else {
+				rows = append(rows, []richButton{cbButton("⬜ "+it.Title, "cfg:toggle:"+it.Key, styleNone)})
+			}
+			continue
+		}
+		rows = append(rows, []richButton{cbButton("✏️ "+it.Title, "cfg:edit:"+it.Key, styleNone)})
+	}
+	rows = append(rows, []richButton{cbButton(i18n.T("settings.back"), "cfg:menu", styleLink)})
+
+	return richMsg{HTML: h.String(), Rows: rows}
 }
 
-func (b *Bot) handleSettingsCommand(ctx context.Context, msg *telego.Message) {
+func (b *Bot) editScreen(it SettingItem, n notice) richMsg {
+	var h strings.Builder
+	h.WriteString("<h3>✏️ " + escapeHTML(it.Title) + "</h3>")
+	h.WriteString(n.html())
+
+	source := i18n.T("settings.source_env")
+	if it.Overridden {
+		source = i18n.T("settings.source_bot")
+	}
+	h.WriteString("<table bordered compact>")
+	h.WriteString(tableRow(i18n.T("settings.current"), displayValue(it)))
+	h.WriteString(tableRow(i18n.T("settings.source"), escapeHTML(source)))
+	h.WriteString(tableRow(i18n.T("settings.env_key"), "<code>"+escapeHTML(it.Key)+"</code>"))
+	h.WriteString("</table>")
+
+	if hint := optionalT("setting_hint." + it.Key); hint != "" {
+		h.WriteString("<blockquote>💡 " + escapeHTML(hint) + "</blockquote>")
+	}
+
+	var options []string
+	switch it.Kind {
+	case SettingInt, SettingFloat:
+		h.WriteString("<p>" + escapeHTML(i18n.T("settings.prompt_input")) + "</p>")
+		options = settingPresets[it.Key]
+	default:
+		h.WriteString("<p>" + escapeHTML(i18n.T("settings.prompt_choose")) + "</p>")
+		options = it.Allowed
+	}
+
+	var rows [][]richButton
+	var row []richButton
+	for _, v := range options {
+		label := v
+		if minuteKeys[it.Key] {
+			if n, err := strconv.Atoi(v); err == nil {
+				label = FormatDuration(n)
+			}
+		}
+		btn := cbButton(label, "cfg:set:"+it.Key+":"+v, styleNone)
+		if v == it.Display {
+			btn = cbButton("✅ "+label, "cfg:set:"+it.Key+":"+v, styleSuccess)
+		}
+		row = append(row, btn)
+		if len(row) == 3 {
+			rows = append(rows, row)
+			row = nil
+		}
+	}
+	if len(row) > 0 {
+		rows = append(rows, row)
+	}
+
+	if it.Overridden {
+		rows = append(rows, []richButton{cbButton(i18n.T("settings.reset_one"), "cfg:reset:"+it.Key, styleDanger)})
+	}
+	rows = append(rows, []richButton{
+		cbButton(i18n.T("settings.back"), "cfg:sec:"+groupOf(it.Key), styleLink),
+		cbButton(i18n.T("settings.to_menu"), "cfg:menu", styleLink),
+	})
+
+	return richMsg{HTML: h.String(), Rows: rows}
+}
+
+func (b *Bot) resetAllScreen() richMsg {
+	var h strings.Builder
+	h.WriteString("<h3>" + escapeHTML(i18n.T("settings.reset_all_title")) + "</h3>")
+	h.WriteString("<p>" + escapeHTML(i18n.T("settings.reset_all_confirm")) + "</p>")
+
+	var list strings.Builder
+	for _, it := range b.settings.Items() {
+		if it.Overridden {
+			list.WriteString("<li><b>" + escapeHTML(it.Title) + "</b>: " + displayValue(it) + "</li>")
+		}
+	}
+	if list.Len() > 0 {
+		h.WriteString("<ul>" + list.String() + "</ul>")
+	}
+
+	rows := [][]richButton{{
+		cbButton(i18n.T("settings.reset_all_yes"), "cfg:resetall:yes", styleDanger),
+		cbButton(i18n.T("settings.cancel"), "cfg:menu", styleNone),
+	}}
+	return richMsg{HTML: h.String(), Rows: rows}
+}
+
+func (b *Bot) handleSettingsCommand(ctx context.Context, msg *models.Message) {
 	if b.settings == nil {
 		return
 	}
@@ -146,47 +431,63 @@ func (b *Bot) handleSettingsCommand(ctx context.Context, msg *telego.Message) {
 		return
 	}
 	b.clearPending(msg.From.ID)
-	b.sendSettingsMenu(ctx, msg.Chat.ID)
+	if _, err := b.sendRich(ctx, msg.Chat.ID, b.threadFor(msg.Chat.ID), b.menuScreen(notice{})); err != nil {
+		b.logger.WithError(err).Error("Telegram бот: ошибка отправки меню настроек")
+	}
 }
 
-func (b *Bot) handlePendingInput(ctx context.Context, msg *telego.Message) bool {
+// handlePendingInput принимает значение, введённое после «✏️», и обновляет
+// то же сообщение меню. Значение принимается только в том чате, где открыт
+// экран редактирования: в группе админ может просто переписываться с
+// коллегами, поэтому там значением считается только число, а остальные
+// сообщения бот не трогает. В личке с ботом принимается любой текст, чтобы
+// на опечатку пришла ошибка. После ошибки ввод можно сразу повторить.
+func (b *Bot) handlePendingInput(ctx context.Context, msg *models.Message) {
 	if b.settings == nil {
-		return false
+		return
 	}
-	pend, ok := b.takePending(msg.From.ID)
-	if !ok {
-		return false
+	pend, ok := b.pendingFor(msg.From.ID)
+	if !ok || msg.Chat.ID != pend.chatID {
+		return
 	}
-
-	b.deleteMessage(ctx, msg.Chat.ID, msg.MessageID)
-
 	raw := strings.TrimSpace(msg.Text)
+	if msg.Chat.Type != models.ChatTypePrivate && !looksNumeric(raw) {
+		return
+	}
+
+	b.clearPending(msg.From.ID)
+	b.deleteMessage(ctx, msg.Chat.ID, msg.ID)
+
+	it, ok := b.settings.Item(pend.key)
+	if !ok {
+		return
+	}
+
+	var screen richMsg
 	display, err := b.settings.Apply(ctx, pend.key, raw)
 	if err != nil {
-		b.replyText(ctx, pend.chatID, fmt.Sprintf("%s: %s", i18n.T("settings.apply_error"), err.Error()))
-		return true
+		screen = b.editScreen(it, notice{text: err.Error(), isErr: true})
+	} else {
+		screen = b.sectionScreen(groupOf(pend.key), notice{text: fmt.Sprintf(i18n.T("settings.applied"), it.Title, display)})
 	}
 
-	title := pend.key
-	if it, ok := b.settings.Item(pend.key); ok {
-		title = it.Title
-	}
-	b.replyText(ctx, pend.chatID, fmt.Sprintf(i18n.T("settings.applied"), title, display))
-	b.sendSettingsMenu(ctx, pend.chatID)
-	return true
-}
-
-func (b *Bot) replyText(ctx context.Context, chatID int64, text string) {
-	msg := tu.Message(tu.ID(chatID), text).WithParseMode(telego.ModeHTML)
-	if b.threadID != 0 && chatID == b.chatID {
-		msg = msg.WithMessageThreadID(int(b.threadID))
-	}
-	if _, err := b.api.SendMessage(ctx, msg); err != nil {
-		b.logger.WithError(err).Error("Telegram бот: ошибка отправки ответа настроек")
+	id := b.showScreen(ctx, pend.chatID, pend.messageID, screen)
+	if err != nil && id != 0 {
+		pend.messageID = id
+		b.keepPending(msg.From.ID, pend)
 	}
 }
 
-func (b *Bot) handleSettingsCallback(ctx context.Context, callback *telego.CallbackQuery) {
+// looksNumeric — похоже ли сообщение на значение числового параметра.
+func looksNumeric(s string) bool {
+	if s == "" || strings.ContainsAny(s, " \t\n") {
+		return false
+	}
+	_, err := strconv.ParseFloat(s, 64)
+	return err == nil
+}
+
+func (b *Bot) handleSettingsCallback(ctx context.Context, callback *models.CallbackQuery) {
 	answer := func(text string) {
 		b.answerCallback(ctx, callback.ID, text)
 	}
@@ -198,126 +499,119 @@ func (b *Bot) handleSettingsCallback(ctx context.Context, callback *telego.Callb
 
 	b.clearPending(callback.From.ID)
 
-	var chatID int64
-	var messageID int
-	if msg, ok := callback.Message.(*telego.Message); ok {
-		chatID = msg.Chat.ID
-		messageID = msg.MessageID
+	chatID, messageID, _ := callbackMessage(callback)
+	show := func(m richMsg) int {
+		return b.showScreen(ctx, chatID, messageID, m)
+	}
+	applyErr := func(err error) string {
+		return i18n.T("settings.apply_error") + ": " + err.Error()
 	}
 
 	parts := strings.Split(callback.Data, ":")
-
 	verb := ""
 	if len(parts) > 1 {
 		verb = parts[1]
 	}
+	arg := ""
+	if len(parts) > 2 {
+		arg = parts[2]
+	}
 
 	switch verb {
 	case "menu":
-		b.editMarkup(ctx, chatID, messageID, i18n.T("settings.title"), b.buildMenuKeyboard())
+		show(b.menuScreen(notice{}))
+		answer("")
+
+	case "sec":
+		show(b.sectionScreen(arg, notice{}))
 		answer("")
 
 	case "toggle":
-		if len(parts) < 3 {
-			answer("")
-			return
-		}
-		key := parts[2]
-		it, ok := b.settings.Item(key)
+		it, ok := b.settings.Item(arg)
 		if !ok {
-			answer("")
+			answer(i18n.T("callback.stale"))
 			return
 		}
 		newVal := "true"
 		if it.Display == "true" {
 			newVal = "false"
 		}
-		display, err := b.settings.Apply(ctx, key, newVal)
+		display, err := b.settings.Apply(ctx, arg, newVal)
 		if err != nil {
-			answer(i18n.T("settings.apply_error") + ": " + err.Error())
+			show(b.sectionScreen(groupOf(arg), notice{text: err.Error(), isErr: true}))
+			answer(truncateAnswer(applyErr(err)))
 			return
 		}
-		b.editMarkup(ctx, chatID, messageID, i18n.T("settings.title"), b.buildMenuKeyboard())
+		show(b.sectionScreen(groupOf(arg), notice{text: fmt.Sprintf(i18n.T("settings.applied"), it.Title, display)}))
 		answer(fmt.Sprintf(i18n.T("settings.applied_toast"), it.Title+": "+display))
 
 	case "edit":
-		if len(parts) < 3 {
-			answer("")
-			return
-		}
-		key := parts[2]
-		it, ok := b.settings.Item(key)
+		it, ok := b.settings.Item(arg)
 		if !ok {
-			answer("")
+			answer(i18n.T("callback.stale"))
 			return
 		}
+		id := show(b.editScreen(it, notice{}))
 		if it.Kind == SettingInt || it.Kind == SettingFloat {
-			b.setPending(callback.From.ID, key, chatID)
-			b.editMarkup(ctx, chatID, messageID,
-				fmt.Sprintf(i18n.T("settings.prompt_input"), it.Title, it.Display),
-				b.buildEditKeyboard(it))
+			if id != 0 {
+				b.setPending(callback.From.ID, arg, chatID, id)
+			}
 			answer(i18n.T("settings.prompt_input_toast"))
 			return
 		}
-		b.editMarkup(ctx, chatID, messageID,
-			fmt.Sprintf(i18n.T("settings.prompt_choose"), it.Title, it.Display),
-			b.buildEditKeyboard(it))
 		answer("")
 
 	case "set":
 		if len(parts) < 4 {
-			answer("")
+			answer(i18n.T("callback.stale"))
 			return
 		}
-		key, value := parts[2], parts[3]
-		display, err := b.settings.Apply(ctx, key, value)
+		value := strings.Join(parts[3:], ":")
+		it, ok := b.settings.Item(arg)
+		if !ok {
+			answer(i18n.T("callback.stale"))
+			return
+		}
+		display, err := b.settings.Apply(ctx, arg, value)
 		if err != nil {
-			answer(i18n.T("settings.apply_error") + ": " + err.Error())
+			show(b.editScreen(it, notice{text: err.Error(), isErr: true}))
+			answer(truncateAnswer(applyErr(err)))
 			return
 		}
-		b.editMarkup(ctx, chatID, messageID, i18n.T("settings.title"), b.buildMenuKeyboard())
+		show(b.sectionScreen(groupOf(arg), notice{text: fmt.Sprintf(i18n.T("settings.applied"), it.Title, display)}))
 		answer(fmt.Sprintf(i18n.T("settings.applied_toast"), display))
 
 	case "reset":
-		if len(parts) < 3 {
-			answer("")
+		it, ok := b.settings.Item(arg)
+		if !ok {
+			answer(i18n.T("callback.stale"))
 			return
 		}
-		key := parts[2]
-		display, err := b.settings.Reset(ctx, key)
+		display, err := b.settings.Reset(ctx, arg)
 		if err != nil {
-			answer(i18n.T("settings.apply_error") + ": " + err.Error())
+			show(b.editScreen(it, notice{text: err.Error(), isErr: true}))
+			answer(truncateAnswer(applyErr(err)))
 			return
 		}
-		b.editMarkup(ctx, chatID, messageID, i18n.T("settings.title"), b.buildMenuKeyboard())
+		show(b.sectionScreen(groupOf(arg), notice{text: fmt.Sprintf(i18n.T("settings.reset_done"), it.Title, display)}))
 		answer(fmt.Sprintf(i18n.T("settings.reset_toast"), display))
 
 	case "resetall":
-		if err := b.settings.ResetAll(ctx); err != nil {
-			answer(i18n.T("settings.apply_error") + ": " + err.Error())
+		if arg != "yes" {
+			show(b.resetAllScreen())
+			answer("")
 			return
 		}
-		b.editMarkup(ctx, chatID, messageID, i18n.T("settings.title"), b.buildMenuKeyboard())
+		if err := b.settings.ResetAll(ctx); err != nil {
+			show(b.menuScreen(notice{text: err.Error(), isErr: true}))
+			answer(truncateAnswer(applyErr(err)))
+			return
+		}
+		show(b.menuScreen(notice{text: i18n.T("settings.reset_all_toast")}))
 		answer(i18n.T("settings.reset_all_toast"))
 
 	default:
-		answer("")
-	}
-}
-
-func (b *Bot) editMarkup(ctx context.Context, chatID int64, messageID int, text string, keyboard *telego.InlineKeyboardMarkup) {
-	if chatID == 0 || messageID == 0 {
-		return
-	}
-	_, err := b.api.EditMessageText(ctx, &telego.EditMessageTextParams{
-		ChatID:      tu.ID(chatID),
-		MessageID:   messageID,
-		Text:        text,
-		ParseMode:   telego.ModeHTML,
-		ReplyMarkup: keyboard,
-	})
-	if err != nil {
-		b.logger.WithError(err).Error("Telegram бот: ошибка обновления меню настроек")
+		answer(i18n.T("callback.stale"))
 	}
 }
 
@@ -325,10 +619,19 @@ func (b *Bot) deleteMessage(ctx context.Context, chatID int64, messageID int) {
 	if chatID == 0 || messageID == 0 {
 		return
 	}
-	if err := b.api.DeleteMessage(ctx, &telego.DeleteMessageParams{
-		ChatID:    tu.ID(chatID),
+	if _, err := b.api.DeleteMessage(ctx, &tgbot.DeleteMessageParams{
+		ChatID:    chatID,
 		MessageID: messageID,
 	}); err != nil {
 		b.logger.WithError(err).Debug("Telegram бот: не удалось удалить сообщение с введённым значением")
 	}
+}
+
+// threadFor возвращает тему форума только для основного чата: в личке
+// с админом message_thread_id не нужен.
+func (b *Bot) threadFor(chatID int64) int {
+	if chatID == b.chatID {
+		return int(b.threadID)
+	}
+	return 0
 }

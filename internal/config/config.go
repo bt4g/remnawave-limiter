@@ -3,9 +3,11 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -44,6 +46,7 @@ type Config struct {
 	RemnawaveHeaders         string
 	WebhookURL               string
 	WebhookSecret            string
+	WebhookSecretHeader      bool
 	SubnetGrouping           bool
 	SubnetPrefixV4           int
 	ASNGrouping              bool
@@ -62,6 +65,10 @@ var (
 	LogLevels  = []string{"trace", "debug", "info", "warn", "error"}
 	LogFormats = []string{"text", "json"}
 )
+
+// MaxToleranceMultiplier — верхняя граница TOLERANCE_MULTIPLIER. Больший множитель
+// ничего не даёт на практике, а огромные значения переполняют int при расчёте порога.
+const MaxToleranceMultiplier = 100
 
 func LoadConfig(envPath string) (*Config, error) {
 	return LoadConfigWithOverrides(envPath, nil)
@@ -141,6 +148,7 @@ func LoadConfigWithOverrides(envPath string, overrides map[string]string) (*Conf
 		RemnawaveHeaders:         l.getEnv("REMNAWAVE_HEADERS", ""),
 		WebhookURL:               l.getEnv("WEBHOOK_URL", ""),
 		WebhookSecret:            l.getEnv("WEBHOOK_SECRET", ""),
+		WebhookSecretHeader:      l.getEnvBool("WEBHOOK_SECRET_HEADER", true),
 		SubnetGrouping:           l.getEnvBool("SUBNET_GROUPING", false),
 		SubnetPrefixV4:           l.getEnvInt("SUBNET_PREFIX_V4", 24),
 		ASNGrouping:              l.getEnvBool("ASN_GROUPING", false),
@@ -214,8 +222,13 @@ func (cfg *Config) Validate() error {
 		}
 	}
 
-	if cfg.ToleranceMultiplier < 0 {
-		return fmt.Errorf("TOLERANCE_MULTIPLIER не может быть отрицательным, получено %v", cfg.ToleranceMultiplier)
+	// NaN и Inf проходят strconv.ParseFloat, а int(NaN) на amd64 — огромное
+	// отрицательное число: порог бана ушёл бы ниже нуля для всех пользователей.
+	if math.IsNaN(cfg.ToleranceMultiplier) || cfg.ToleranceMultiplier < 0 || cfg.ToleranceMultiplier > MaxToleranceMultiplier {
+		return fmt.Errorf("TOLERANCE_MULTIPLIER должен быть в диапазоне 0..%d, получено %v", MaxToleranceMultiplier, cfg.ToleranceMultiplier)
+	}
+	if err := validateThresholdReachable(cfg); err != nil {
+		return err
 	}
 	if cfg.SubnetPrefixV4 < 8 || cfg.SubnetPrefixV4 > 32 {
 		return fmt.Errorf("SUBNET_PREFIX_V4 должен быть в диапазоне 8..32, получено %d", cfg.SubnetPrefixV4)
@@ -276,6 +289,25 @@ func (cfg *Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+// validateThresholdReachable проверяет, что VIOLATION_THRESHOLD вообще можно
+// набрать. Пороговый счётчик растёт не чаще раза за COOLDOWN (кулдаун ставится
+// до инкремента), а следующее нарушение замечается на ближайшей проверке после
+// него. Если N-1 таких шагов не укладываются в окно, счётчик истекает раньше,
+// чем дойдёт до порога, и лимитер молча перестаёт действовать.
+func validateThresholdReachable(cfg *Config) error {
+	if cfg.ViolationThreshold <= 1 {
+		return nil
+	}
+	step := int64(cfg.Cooldown) + int64(cfg.CheckInterval)
+	need := int64(cfg.ViolationThreshold-1) * step
+	if need < int64(cfg.ViolationThresholdWindow) {
+		return nil
+	}
+	return fmt.Errorf("VIOLATION_THRESHOLD=%d недостижим: между нарушениями проходит не меньше COOLDOWN + CHECK_INTERVAL (%dс), "+
+		"%d таких шагов — %dс, а VIOLATION_THRESHOLD_WINDOW=%dс. Увеличьте окно больше %dс или уменьшите COOLDOWN либо порог",
+		cfg.ViolationThreshold, step, cfg.ViolationThreshold-1, need, cfg.ViolationThresholdWindow, need)
 }
 
 func validateBaseURL(key, raw string) error {
@@ -408,6 +440,51 @@ func (l *loader) getEnvBool(key string, defaultValue bool) bool {
 		return defaultValue
 	}
 	return b
+}
+
+// MergeSavedOverrides применяет переопределения, сохранённые ботом в Redis,
+// поверх .env. Ключи вне реестра и значения, которые не проходят валидацию,
+// отбрасываются по одному, а не все разом: иначе одно устаревшее значение
+// (например, после обновления с более строгой проверкой) молча отменяло бы
+// все остальные настройки при каждом запуске. Возвращает итоговый конфиг,
+// применённые переопределения и причины отказа для отброшенных ключей.
+func MergeSavedOverrides(envPath string, saved map[string]string) (*Config, map[string]string, map[string]error, error) {
+	rejected := make(map[string]error)
+	accepted := make(map[string]string, len(saved))
+	for key, value := range saved {
+		if err := ValidateRaw(key, value); err != nil {
+			rejected[key] = err
+			continue
+		}
+		accepted[key] = value
+	}
+
+	if cfg, err := LoadConfigWithOverrides(envPath, accepted); err == nil {
+		return cfg, accepted, rejected, nil
+	}
+
+	// Вместе значения не проходят — набираем совместимые по одному
+	// в стабильном порядке, чтобы результат не зависел от обхода map.
+	keys := make([]string, 0, len(accepted))
+	for key := range accepted {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	kept := make(map[string]string, len(accepted))
+	for _, key := range keys {
+		kept[key] = accepted[key]
+		if _, err := LoadConfigWithOverrides(envPath, kept); err != nil {
+			delete(kept, key)
+			rejected[key] = err
+		}
+	}
+
+	cfg, err := LoadConfigWithOverrides(envPath, kept)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	return cfg, kept, rejected, nil
 }
 
 func ParseDailyReportTime(s string) (hour, minute int, err error) {

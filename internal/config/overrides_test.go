@@ -69,3 +69,79 @@ func TestValidateRaw(t *testing.T) {
 		}
 	}
 }
+
+func TestMergeSavedOverrides_AllValid(t *testing.T) {
+	clearEnv()
+	setRequiredEnv()
+	defer clearEnv()
+
+	cfg, applied, rejected, err := MergeSavedOverrides("", map[string]string{"COOLDOWN": "222", "ACTION_MODE": "auto"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cooldown != 222 || cfg.ActionMode != "auto" {
+		t.Errorf("переопределения не применены: cooldown=%d mode=%s", cfg.Cooldown, cfg.ActionMode)
+	}
+	if len(applied) != 2 || len(rejected) != 0 {
+		t.Errorf("applied=%v rejected=%v", applied, rejected)
+	}
+}
+
+// Одно невалидное значение не должно отменять остальные переопределения.
+func TestMergeSavedOverrides_DropsOnlyInvalidKeys(t *testing.T) {
+	clearEnv()
+	setRequiredEnv()
+	defer clearEnv()
+
+	saved := map[string]string{
+		"COOLDOWN":             "222",
+		"TOLERANCE_MULTIPLIER": "NaN",
+		"TELEGRAM_BOT_TOKEN":   "1:evil",
+		"CHECK_INTERVAL":       "-1",
+	}
+	cfg, applied, rejected, err := MergeSavedOverrides("", saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Cooldown != 222 {
+		t.Errorf("валидное переопределение потеряно: COOLDOWN=%d", cfg.Cooldown)
+	}
+	if cfg.TelegramBotToken != "123456:ABC-DEF" {
+		t.Errorf("нередактируемый ключ применён: %q", cfg.TelegramBotToken)
+	}
+	if len(applied) != 1 || applied["COOLDOWN"] != "222" {
+		t.Errorf("applied = %v", applied)
+	}
+	for _, key := range []string{"TOLERANCE_MULTIPLIER", "TELEGRAM_BOT_TOKEN", "CHECK_INTERVAL"} {
+		if rejected[key] == nil {
+			t.Errorf("%s должен быть отброшен, rejected = %v", key, rejected)
+		}
+	}
+}
+
+// Значения, которые по отдельности валидны, но вместе дают недостижимый порог:
+// сохраняется совместимое подмножество, а не ничего.
+func TestMergeSavedOverrides_ConflictingCombination(t *testing.T) {
+	clearEnv()
+	setRequiredEnv()
+	defer clearEnv()
+
+	saved := map[string]string{
+		"COOLDOWN":            "3600",
+		"VIOLATION_THRESHOLD": "3",
+		"IGNORE_DURATION":     "60",
+	}
+	cfg, applied, rejected, err := MergeSavedOverrides("", saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.IgnoreDuration != 60 {
+		t.Errorf("независимое переопределение потеряно: IGNORE_DURATION=%d", cfg.IgnoreDuration)
+	}
+	if len(rejected) != 1 || len(applied) != 2 {
+		t.Errorf("ожидался один отброшенный ключ: applied=%v rejected=%v", applied, rejected)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("итоговый конфиг невалиден: %v", err)
+	}
+}

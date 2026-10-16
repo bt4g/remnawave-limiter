@@ -525,3 +525,53 @@ func TestCache_RestoreTimer_CanBeRequeued(t *testing.T) {
 		t.Errorf("после возврата в очередь получено %v, want 1 запись", requeued)
 	}
 }
+
+// Нулевой TTL в Redis — «без срока», поэтому временный whitelist с ним
+// незаметно стал бы вечным. Проверка срабатывает до обращения к Redis.
+func TestCache_WhitelistTemp_RejectsNonPositiveTTL(t *testing.T) {
+	c, err := New("redis://127.0.0.1:1/15")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	for _, ttl := range []time.Duration{0, -time.Minute} {
+		if err := c.AddToWhitelistTemp(context.Background(), 5, ttl); err == nil {
+			t.Errorf("AddToWhitelistTemp с TTL %v должен вернуть ошибку", ttl)
+		}
+	}
+}
+
+func TestCache_RemoveRestoreTimer(t *testing.T) {
+	c := setupTestCache(t)
+	ctx := context.Background()
+
+	if err := c.SetRestoreTimer(ctx, 7, -time.Second); err != nil {
+		t.Fatalf("SetRestoreTimer: %v", err)
+	}
+	if err := c.SetRestoreTimer(ctx, 8, -time.Second); err != nil {
+		t.Fatalf("SetRestoreTimer: %v", err)
+	}
+	if _, err := c.IncrRestoreAttempts(ctx, 7); err != nil {
+		t.Fatalf("IncrRestoreAttempts: %v", err)
+	}
+
+	if err := c.RemoveRestoreTimer(ctx, 7); err != nil {
+		t.Fatalf("RemoveRestoreTimer: %v", err)
+	}
+	// Повторное снятие и снятие несуществующего таймера — не ошибка.
+	if err := c.RemoveRestoreTimer(ctx, 7); err != nil {
+		t.Fatalf("повторный RemoveRestoreTimer: %v", err)
+	}
+
+	expired, err := c.GetExpiredRestoreTimers(ctx)
+	if err != nil {
+		t.Fatalf("GetExpiredRestoreTimers: %v", err)
+	}
+	if len(expired) != 1 || expired[0] != "8" {
+		t.Errorf("в очереди должен остаться только 8, получено %v", expired)
+	}
+	if n, _ := c.client.Exists(ctx, prefixRestoreAttempts+"7").Result(); n != 0 {
+		t.Error("счётчик попыток восстановления должен удаляться вместе с таймером")
+	}
+}

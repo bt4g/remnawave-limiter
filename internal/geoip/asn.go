@@ -2,10 +2,10 @@ package geoip
 
 import (
 	"fmt"
-	"net"
-	"sync/atomic"
+	"net/netip"
+	"sync"
 
-	"github.com/oschwald/maxminddb-golang"
+	"github.com/oschwald/maxminddb-golang/v2"
 )
 
 type ASNInfo struct {
@@ -21,8 +21,14 @@ type NopResolver struct{}
 
 func (NopResolver) Lookup(string) (ASNInfo, bool) { return ASNInfo{}, false }
 
+// DBResolver ищет ASN в базе MaxMind и умеет подменять её на лету.
+//
+// Lookup держит RLock на время поиска и декодирования, а Reload/Close меняют
+// reader под Lock и закрывают старую базу только после этого: Close делает
+// munmap, и поиск, идущий в этот момент по старой базе, уронил бы процесс.
 type DBResolver struct {
-	reader atomic.Pointer[maxminddb.Reader]
+	mu     sync.RWMutex
+	reader *maxminddb.Reader
 }
 
 func NewDBResolver(path string) (*DBResolver, error) {
@@ -33,9 +39,7 @@ func NewDBResolver(path string) (*DBResolver, error) {
 	if err != nil {
 		return nil, fmt.Errorf("geoip: open %s: %w", path, err)
 	}
-	d := &DBResolver{}
-	d.reader.Store(r)
-	return d, nil
+	return &DBResolver{reader: r}, nil
 }
 
 func (d *DBResolver) Reload(path string) error {
@@ -49,7 +53,12 @@ func (d *DBResolver) Reload(path string) error {
 	if err != nil {
 		return fmt.Errorf("geoip: reload open %s: %w", path, err)
 	}
-	old := d.reader.Swap(r)
+	d.mu.Lock()
+	old := d.reader
+	d.reader = r
+	d.mu.Unlock()
+
+	// Под Lock новых поисков по старой базе уже нет, а начатые завершились.
 	if old != nil {
 		_ = old.Close()
 	}
@@ -60,7 +69,11 @@ func (d *DBResolver) Close() error {
 	if d == nil {
 		return nil
 	}
-	old := d.reader.Swap(nil)
+	d.mu.Lock()
+	old := d.reader
+	d.reader = nil
+	d.mu.Unlock()
+
 	if old == nil {
 		return nil
 	}
@@ -71,19 +84,21 @@ func (d *DBResolver) Lookup(ipStr string) (ASNInfo, bool) {
 	if d == nil {
 		return ASNInfo{}, false
 	}
-	r := d.reader.Load()
-	if r == nil {
-		return ASNInfo{}, false
-	}
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
+	ip, err := netip.ParseAddr(ipStr)
+	if err != nil {
 		return ASNInfo{}, false
 	}
 	var rec struct {
 		ASN uint32 `maxminddb:"autonomous_system_number"`
 		Org string `maxminddb:"autonomous_system_organization"`
 	}
-	if err := r.Lookup(ip, &rec); err != nil {
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.reader == nil {
+		return ASNInfo{}, false
+	}
+	if err := d.reader.Lookup(ip.Unmap()).Decode(&rec); err != nil {
 		return ASNInfo{}, false
 	}
 	if rec.ASN == 0 {
